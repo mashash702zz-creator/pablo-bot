@@ -12,10 +12,10 @@ from telethon.errors import SessionPasswordNeededError
 # ==================== Configuration ====================
 API_ID = 39686732
 API_HASH = "4ccd261405e1fe78120b5e0a0efe48a7"
-BOT_TOKEN = "8619643812:AAGN80E9HP0F_PePe45QCvs4MS6HawNnYNI"
+BOT_TOKEN = "8949542441:AAGYvRu0ASHzRJX2lczGB2XeArrgYVKEMc0"
 
 # آيدي بوت الإدارة لمنع التداخل (تم وضعه هنا)
-manager_bot_id = 8619643812
+manager_bot_id = 8949542441
 
 # قائمة المسؤولين (المطور الأساسي)
 ADMIN_IDS = [520859814]
