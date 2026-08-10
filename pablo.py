@@ -5,6 +5,7 @@ import secrets
 import time
 import json
 import re
+import yt_dlp
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError
 
@@ -48,13 +49,14 @@ SPEED_MAP = {
     "10": 10.0
 }
 
-# قواعد البيانات في الذاكرة
+# قواعد البيانات في الذاكرة والتخزين المؤقت للبحث
 activation_codes = {}
 users_db = {}
 user_clients = {}
 user_states = {}
+search_cache = {}
 
-# القوائم الأساسية العامة
+# القوائم الأساسية العامة (تدار عبر لوحة الأدمن وتنعكس للجميع)
 default_tastir = []
 default_fardiyyat = []
 default_reply = []
@@ -117,7 +119,10 @@ def init_user_db(user_id):
     u.setdefault("tastir", [])
     u.setdefault("fardiyyat", [])
     u.setdefault("reply", [])
+    u.setdefault("bot_responses", [])
     u.setdefault("voices", {})
+    u.setdefault("include_tastir_in_reply", True)
+    u.setdefault("include_fardiyyat_in_reply", True)
     u.setdefault("tastir_start_cmds", ["تسطير"])
     u.setdefault("tastir_stop_cmds", ["ايقاف التسطير"])
     u.setdefault("fardiyyat_start_cmds", ["فرديات"])
@@ -209,6 +214,78 @@ async def apply_activation_code(user_id, code, event):
         return True, days
     return False, 0
 
+async def search_and_download_youtube(query):
+    def download():
+        if query in search_cache:
+            video_info = search_cache[query]
+            vid = video_info.get('id')
+            title = video_info.get('title', 'Audio')
+            duration = int(video_info.get('duration', 0))
+            uploader = video_info.get('uploader', 'YouTube')
+            
+            file_path = os.path.join(VOICES_DIR, f"{vid}.mp3")
+            if os.path.exists(file_path):
+                thumb_path = None
+                for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                    tp = os.path.join(VOICES_DIR, f"{vid}{ext}")
+                    if os.path.exists(tp):
+                        thumb_path = tp
+                        break
+                return file_path, title, duration, uploader, thumb_path
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'default_search': 'ytsearch1',
+            'socket_timeout': 10,
+            'quiet': True,
+            'no_warnings': True,
+            'writethumbnail': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web']
+                }
+            },
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
+            'outtmpl': os.path.join(VOICES_DIR, '%(id)s.%(ext)s'),
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+            if 'entries' in info:
+                if not info['entries']:
+                    return None, None, None, None, None
+                video_info = info['entries'][0]
+            else:
+                video_info = info
+            
+            search_cache[query] = video_info
+            
+            vid = video_info.get('id')
+            title = video_info.get('title', 'Audio')
+            duration = int(video_info.get('duration', 0))
+            uploader = video_info.get('uploader', 'YouTube')
+            
+            file_path = os.path.join(VOICES_DIR, f"{vid}.mp3")
+            if not os.path.exists(file_path):
+                for f in os.listdir(VOICES_DIR):
+                    if f.startswith(vid) and f.endswith('.mp3'):
+                        file_path = os.path.join(VOICES_DIR, f)
+                        break
+            
+            thumb_path = None
+            for ext in ['.jpg', '.jpeg', '.png', '.webp']:
+                tp = os.path.join(VOICES_DIR, f"{vid}{ext}")
+                if os.path.exists(tp):
+                    thumb_path = tp
+                    break
+                    
+            return file_path, title, duration, uploader, thumb_path
+
+    return await asyncio.to_thread(download)
+
 def stop_running_task(owner_id, chat_id=None, target_user_id=None, mode=None):
     keys_to_remove = []
     for key, info in list(running_tasks.items()):
@@ -258,16 +335,44 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                     phrases = []
 
                 curr_target_msg_id = task_info.get("target_msg_id")
+                target_uid = task_info.get("target_user_id")
                 
                 if phrases:
                     phrase = random.choice(phrases)
-                    try:
-                        if curr_target_msg_id:
+                    sent = False
+                    
+                    if curr_target_msg_id:
+                        try:
                             await client.send_message(chat_id, phrase, reply_to=curr_target_msg_id)
-                        else:
-                            await client.send_message(chat_id, phrase)
-                    except Exception:
-                        pass
+                            sent = True
+                        except Exception:
+                            if target_uid:
+                                try:
+                                    async for msg in client.iter_messages(chat_id, from_user=target_uid, limit=1):
+                                        task_info["target_msg_id"] = msg.id
+                                        curr_target_msg_id = msg.id
+                                        await client.send_message(chat_id, phrase, reply_to=curr_target_msg_id)
+                                        sent = True
+                                        break
+                                except Exception:
+                                    pass
+                    
+                    if not sent:
+                        final_text = phrase
+                        if target_uid and chat_id != target_uid:
+                            try:
+                                user_entity = await client.get_entity(target_uid)
+                                u_name = user_entity.first_name or "مستخدم"
+                                mention = f"@{user_entity.username}" if user_entity.username else f"[{u_name}](tg://openmessage?user_id={target_uid})"
+                                final_text = f"{phrase} {mention}"
+                            except Exception:
+                                pass
+                        
+                        try:
+                            await client.send_message(chat_id, final_text)
+                            sent = True
+                        except Exception:
+                            pass
                 
                 delay = user_info.get("speed", 1.0)
                 await asyncio.sleep(delay)
@@ -324,7 +429,37 @@ async def register_userbot_events(client_inst, owner_id):
             cmd_parts = text.split()
             cmd_first_word = cmd_parts[0] if cmd_parts else ""
 
-            # صوتية
+            if text.startswith("بحث "):
+                query = text[3:].strip()
+                if query:
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                    
+                    search_msg = await client_inst.send_message(chat_id, f"🔍 جاري البحث في يوتيوب عن: `{query}`...")
+                    try:
+                        file_path, title, duration, uploader, thumb_path = await search_and_download_youtube(query)
+                        if file_path and os.path.exists(file_path):
+                            await search_msg.delete()
+                            await client_inst.send_file(
+                                chat_id,
+                                file_path,
+                                thumb=thumb_path,
+                                duration=duration,
+                                title=title,
+                                performer=uploader,
+                                voice_note=False
+                            )
+                        else:
+                            await search_msg.edit("❌ لم يتم العثور على نتائج مطابقة لبحثك.")
+                    except Exception as e:
+                        try:
+                            await search_msg.edit(f"❌ حدث خطأ أثناء البحث والتحميل: `{e}`")
+                        except Exception:
+                            pass
+                return
+
             voice_match = re.match(r"^(صوتيه|صوتية)\s*(\d+)$", text)
             if voice_match:
                 voice_num = voice_match.group(2)
@@ -531,15 +666,42 @@ async def register_userbot_events(client_inst, owner_id):
                 if info.get("owner_id") == owner_id and info.get("chat_id") == chat_id and info.get("target_user_id") == sender_id:
                     info["target_msg_id"] = event.id
 
+            is_target_active_user = False
+            for key, info in list(running_tasks.items()):
+                if info.get("owner_id") == owner_id and info.get("chat_id") == chat_id and info.get("target_user_id") == sender_id:
+                    is_target_active_user = True
+                    break
+
+            if is_target_active_user and is_subscribed(owner_id):
+                bot_responses = user_info.get("bot_responses", [])
+                if bot_responses and text:
+                    matched_response = None
+                    cleaned_msg_text = text.lower()
+                    
+                    for item in bot_responses:
+                        if item.lower() in cleaned_msg_text:
+                            matched_response = item
+                            break
+                    
+                    if matched_response:
+                        phrase = random.choice(bot_responses)
+                        try:
+                            await client_inst.send_message(chat_id, phrase, reply_to=event.id)
+                            return
+                        except Exception:
+                            pass
+
             reply_key = (owner_id, chat_id, sender_id, "reply")
             if reply_key in running_tasks:
                 if is_subscribed(owner_id):
-                    user_phrases = (
-                        user_info.get("reply", []) + 
-                        user_info.get("tastir", []) + 
-                        user_info.get("fardiyyat", [])
-                    )
-                    phrases = user_phrases + default_reply + default_tastir + default_fardiyyat
+                    phrases = list(user_info.get("reply", []) + default_reply)
+                    
+                    if user_info.get("include_tastir_in_reply", True):
+                        phrases += user_info.get("tastir", []) + default_tastir
+                        
+                    if user_info.get("include_fardiyyat_in_reply", True):
+                        phrases += user_info.get("fardiyyat", []) + default_fardiyyat
+
                     if phrases:
                         phrase = random.choice(phrases)
                         try:
@@ -557,8 +719,8 @@ def main_menu_keyboard(user_id):
         buttons.append([Button.inline("🎟️ تفعيل كود الاشتراك", b"enter_code_start")])
         
     buttons.append([Button.inline("📝 التسطير", b"tastir_menu"), Button.inline("🎯 الفرديات", b"fardiyyat_menu")])
-    buttons.append([Button.inline("💬 الريبلاي", b"reply_menu"), Button.inline("🔇 الكتم", b"mute_menu")])
-    buttons.append([Button.inline("🎙️ الصوتيات", b"voice_menu"), Button.inline("🧹 أوامر المسح", b"purge_menu")])
+    buttons.append([Button.inline("💬 الريبلاي", b"reply_menu")])
+    buttons.append([Button.inline("⭐ مميزات السورس", b"source_features_menu")])
     buttons.append([Button.inline("⚡ السرعة", b"speed_menu"), Button.inline("📊 حالة الاشتراك", b"sub_info")])
     
     if user_id in ADMIN_IDS:
@@ -570,6 +732,22 @@ def main_menu_keyboard(user_id):
     ])
     return buttons
 
+def source_features_menu_keyboard():
+    return [
+        [Button.inline("🔍 فكرة بحث اليوتيوب", b"feature_youtube_info")],
+        [Button.inline("📌 فكرة التثبيت", b"feature_pin_info")],
+        [Button.inline("🧹 مسح الشامل", b"info_purge_all"), Button.inline("🔢 مسح بالعدد المحدد", b"info_purge_quick")],
+        [Button.inline("🔇 الكتم الشامل", b"mute_menu"), Button.inline("🎙️ الصوتيات", b"voice_menu")],
+        [Button.inline("🔙 رجوع", b"main_menu")]
+    ]
+
+def bot_responses_menu_keyboard():
+    return [
+        [Button.inline("➕ إضافة كلمات وكلمات ردود", b"add_bot_response"), Button.inline("📋 عرض ردود البوت", b"show_bot_responses")],
+        [Button.inline("❌ حذف رد محدد", b"del_bot_response_item_start"), Button.inline("⚠️ حذف جميع ردود البوت", b"clear_bot_responses")],
+        [Button.inline("🔙 رجوع للوحة الأدمن", b"admin_menu")]
+    ]
+
 def voice_menu_keyboard(user_id):
     u = users_db.get(user_id, {})
     v_st = "✅" if u.get("del_voice_cmd", True) else "❌"
@@ -577,7 +755,7 @@ def voice_menu_keyboard(user_id):
         [Button.inline("➕ إضافة صوتية", b"add_voice"), Button.inline("📂 عرض الصوتيات", b"show_voice")],
         [Button.inline(f"🗑️ مسح أمر الصوتية [{v_st}]", b"tog_voice_cmd")],
         [Button.inline("❌ حذف صوتية محددة", b"del_voice_item"), Button.inline("⚠️ مسح جميع الصوتيات", b"clear_voice")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"source_features_menu")]
     ]
 
 def tastir_menu_keyboard(user_id):
@@ -612,8 +790,12 @@ def reply_menu_keyboard(user_id):
     u = users_db.get(user_id, {})
     r_st = "✅" if u.get("del_reply_start", True) else "❌"
     r_sp = "✅" if u.get("del_reply_stop", True) else "❌"
+    t_rep_st = "✅" if u.get("include_tastir_in_reply", True) else "❌"
+    f_rep_st = "✅" if u.get("include_fardiyyat_in_reply", True) else "❌"
     return [
         [Button.inline("➕ إضافة جمل الريبلاي", b"add_reply"), Button.inline("📋 عرض الجمل", b"show_reply")],
+        [Button.inline(f"📝 تضمين التسطير بالريبلاي [{t_rep_st}]", b"tog_rep_tastir")],
+        [Button.inline(f"🎯 تضمين الفرديات بالريبلاي [{f_rep_st}]", b"tog_rep_fardiyyat")],
         [Button.inline("▶️ إضافة أمر تشغيل", b"add_reply_start"), Button.inline("📜 أوامر التشغيل", b"show_reply_start")],
         [Button.inline("⏹️ إضافة أمر إيقاف", b"add_reply_stop"), Button.inline("📜 أوامر الإيقاف", b"show_reply_stop")],
         [Button.inline(f"🗑️ مسح أمر التشغيل [{r_st}]", b"tog_reply_start"), Button.inline(f"🗑️ مسح أمر الإيقاف [{r_sp}]", b"tog_reply_stop")],
@@ -627,19 +809,13 @@ def mute_menu_keyboard(user_id):
     m_st = "✅" if u.get("del_mute_cmd", True) else "❌"
     um_st = "✅" if u.get("del_unmute_cmd", True) else "❌"
     return [
-        [Button.inline("🔇 إضافة أمر كتم", b"add_mute_cmd"), Button.inline("📜 عرض أوامر الكتم", b"show_mute_cmds")],
-        [Button.inline("🔊 إضافة أمر إلغاء كتم", b"add_unmute_cmd"), Button.inline("📜 عرض أوامر إلغاء الكتم", b"show_unmute_cmds")],
+        [Button.inline("🔇 إضافة أمر كتم", b"add_mute_cmd"), Button.inline("📜 أوامر الكتم", b"show_mute_cmds")],
+        [Button.inline("🔊 إضافة أمر إلغاء كتم", b"add_unmute_cmd"), Button.inline("📜 أوامر إلغاء الكتم", b"show_unmute_cmds")],
         [Button.inline("❌ خيارات حذف أوامر الكتم", b"del_mute_cmd_sub")],
         [Button.inline("❌ خيارات حذف أوامر إلغاء الكتم", b"del_unmute_cmd_sub")],
         [Button.inline(f"🗑️ مسح أمر الكتم [{m_st}]", b"tog_mute_cmd"), Button.inline(f"🗑️ مسح أمر إلغاء الكتم [{um_st}]", b"tog_unmute_cmd")],
         [Button.inline("👥 عرض المكتومين", b"show_muted_users"), Button.inline("❌ خيارات حذف المكتومين", b"del_muted_users_sub")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
-    ]
-
-def purge_menu_keyboard():
-    return [
-        [Button.inline("ℹ️ طريقة المسح السريع", b"info_purge_quick"), Button.inline("ℹ️ طريقة مسح جميع الرسائل", b"info_purge_all")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"source_features_menu")]
     ]
 
 def speed_menu_keyboard():
@@ -656,11 +832,27 @@ def speed_menu_keyboard():
 def admin_menu_keyboard():
     return [
         [Button.inline("🎟️ توليد كود اشتراك", b"gen_code"), Button.inline("📢 إذاعة عامة", b"broadcast_start")],
+        [Button.inline("📝 إدارة التسطير الأساسي", b"admin_tastir_menu"), Button.inline("🎯 إدارة الفرديات الأساسية", b"admin_fardiyyat_menu")],
+        [Button.inline("🤖 ردود البوت", b"bot_responses_menu")],
         [Button.inline("👥 قائمة المسؤولين", b"list_admins"), Button.inline("📋 قائمة المستخدمين", b"list_users")],
         [Button.inline("➕ إضافة مسؤول", b"add_admin_start"), Button.inline("❌ حذف مسؤول", b"delete_admin_start")],
         [Button.inline("❌ إلغاء اشتراك مستخدم", b"revoke_user_start")],
         [Button.inline("📊 إحصائيات النظام", b"admin_stats")],
         [Button.inline("🔙 رجوع", b"main_menu")]
+    ]
+
+def admin_tastir_menu_keyboard():
+    return [
+        [Button.inline("➕ إضافة تسطير أساسي", b"add_def_tastir"), Button.inline("📋 عرض التسطير الأساسي", b"show_def_tastir")],
+        [Button.inline("🗑️ حذف جملة أساسية محددة", b"del_def_tastir_item_start"), Button.inline("⚠️ حذف جميع التسطير الأساسي", b"clear_def_tastir")],
+        [Button.inline("🔙 رجوع للوحة الأدمن", b"admin_menu")]
+    ]
+
+def admin_fardiyyat_menu_keyboard():
+    return [
+        [Button.inline("➕ إضافة فرديات أساسية", b"add_def_fardiyyat"), Button.inline("📋 عرض الفرديات الأساسية", b"show_def_fardiyyat")],
+        [Button.inline("🗑️ حذف كلمة أساسية محددة", b"del_def_fardiyyat_item_start"), Button.inline("⚠️ حذف جميع الفرديات الأساسية", b"clear_def_fardiyyat")],
+        [Button.inline("🔙 رجوع للوحة الأدمن", b"admin_menu")]
     ]
 
 # ==================== Bot Event Handlers ====================
@@ -689,11 +881,12 @@ async def start_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
+    global default_tastir, default_fardiyyat, default_reply
     user_id = event.sender_id
     data = event.data
     init_user_db(user_id)
 
-    if data in [b"main_menu", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"mute_menu", b"purge_menu", b"voice_menu", b"admin_menu"]:
+    if data in [b"main_menu", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"bot_responses_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu"]:
         user_states.pop(user_id, None)
 
     if data == b"main_menu":
@@ -704,6 +897,29 @@ async def callback_handler(event):
             "أزرار التحكم بالأسفل 👇:"
         )
         await event.edit(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
+
+    elif data == b"source_features_menu":
+        await event.edit("⭐ **مميزات السورس:**\n\nاختر الخاصية التي تريد الاستعلام عنها أو التحكم بها من القائمة أدناه:", buttons=source_features_menu_keyboard())
+
+    elif data == b"feature_youtube_info":
+        txt = (
+            "🔍 **فكرة بحث اليوتيوب:**\n\n"
+            "يتيح لك السورس البحث عن أي أغنية أو مقطع صوتي في يوتيوب وتحميله وإرساله مباشرة من خلال حسابك الشخصي (اليوزر بوت) كملف صوتي يحتوي على الاسم، اسم القناة، المدة، وصورة الغلاف على اليسار.\n\n"
+            "**كيف تستخدمها؟**\n"
+            "• اكتب في أي محادثة أو قروب: `بحث [اسم الأغنية أو المطلب]`.\n"
+            "• سيقوم الحساب بحذف رسالتك، إرسال رسالة جاري البحث، ثم جلب الملف الصوتي وإرساله فوراً وبدون أي أزرار أو معرفات."
+        )
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+
+    elif data == b"feature_pin_info":
+        txt = (
+            "📌 **فكرة التثبيت:**\n\n"
+            "يتيح لك السورس ميزة تثبيت الرسائل المهمة بسهولة تامة وبأمر سريع عبر حسابك الشخصي (اليوزر بوت).\n\n"
+            "**كيف تستخدمها؟**\n"
+            "• قم بالرد على أي رسالة تريد تثبيتها واكتب: `تثبيت` أو `تثبيت الرسالة`.\n"
+            "• سيقوم الحساب تلقائياً بحذف أمرك وتثبيت الرسالة المطلوبة في المحادثة أو القروب مع إرسال إشعار."
+        )
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
 
     elif data == b"enter_code_start":
         user_states[user_id] = {"step": "awaiting_code_input"}
@@ -732,7 +948,50 @@ async def callback_handler(event):
             buttons=[[Button.inline("🔙 رجوع", b"main_menu")]]
         )
 
-    # Voice Callbacks
+    elif data == b"bot_responses_menu":
+        if user_id not in ADMIN_IDS:
+            await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
+            return
+        await event.edit("🤖 **قائمة ردود البوت المخصصة:**\n\nتتيح لك هذه القائمة إضافة كلمات وردود خاصة بها:", buttons=bot_responses_menu_keyboard())
+
+    elif data == b"add_bot_response":
+        if user_id not in ADMIN_IDS:
+            await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_bot_response"}
+        await event.edit("➕ أرسل الكلمة أو العبارة والرد الخاص بها لتضاف إلى ردود البوت المخصصة:\n\n(يمكنك إرسال عدة كلمات متتالية، وعند الانتهاء اضغط رجوع):", buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+
+    elif data == b"show_bot_responses":
+        if user_id not in ADMIN_IDS:
+            await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
+            return
+        phrases = users_db[user_id].get("bot_responses", [])
+        txt = "📋 **قائمة ردود البوت الخاصة بك:**\n\n" + ("\n".join([f"• `{p}`" for p in phrases]) if phrases else "لا توجد كلمات أو ردود مضافة.")
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+
+    elif data == b"del_bot_response_item_start":
+        if user_id not in ADMIN_IDS:
+            await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
+            return
+        phrases = users_db[user_id].get("bot_responses", [])
+        if not phrases:
+            await event.answer("⚠️ لا توجد كلمات مضافة لحذفها.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_del_bot_response_item"}
+        txt = "📋 **أرسل الكلمة أو الرد الذي تريد حذفه الآن:**\n\n"
+        for p in phrases:
+            txt += f"• `{p}`\n"
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+
+    elif data == b"clear_bot_responses":
+        if user_id not in ADMIN_IDS:
+            await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
+            return
+        users_db[user_id]["bot_responses"] = []
+        save_data()
+        await event.answer("⚠️ تم مسح جميع ردود البوت المخصصة بنجاح.", alert=True)
+        await event.edit("🤖 **قائمة ردود البوت المخصصة:**", buttons=bot_responses_menu_keyboard())
+
     elif data == b"voice_menu":
         await event.edit("🎙️ **قائمة التحكم بالصوتيات:**\n\nاختر من القائمة أدناه:", buttons=voice_menu_keyboard(user_id))
 
@@ -782,30 +1041,25 @@ async def callback_handler(event):
         await event.answer("⚠️ تم مسح جميع الصوتيات بنجاح.", alert=True)
         await event.edit("🎙️ **قائمة التحكم بالصوتيات:**", buttons=voice_menu_keyboard(user_id))
 
-    # Purge Callbacks
-    elif data == b"purge_menu":
-        await event.edit("🧹 **قائمة أوامر المسح:**\nيرجى تحديد الخيار المطلوب:", buttons=purge_menu_keyboard())
-
     elif data == b"info_purge_quick":
         txt = (
-            "ℹ️ **طريقة المسح السريع:**\n\n"
+            "ℹ️ **طريقة المسح بالعدد المحدد:**\n\n"
             "يتيح لك هذا الأمر مسح عدد معين من آخر رسائلك في القروب أو المحادثات الخاصة.\n\n"
             "**كيف تستخدمه؟**\n"
             "• اكتب في المحادثة: `مسح 20` وسيقوم البوت بمسح آخر 20 رسالة أرسلتها أنت فقط.\n"
             "• إذا كتبت `مسح` فقط بدون تحديد رقم، سيمسح تلقائياً آخر 20 رسالة لك."
         )
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"purge_menu")]])
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
 
     elif data == b"info_purge_all":
         txt = (
-            "ℹ️ **طريقة مسح جميع الرسائل:**\n\n"
+            "ℹ️ **طريقة المسح الشامل:**\n\n"
             "يتيح لك هذا الأمر مسح كافة الرسائل التي قمت بإرسالها في المجموعات أو الخاصة من بداية المحادثة.\n\n"
             "**كيف تستخدمه؟**\n"
-            "• اكتب في المحادثة أو القروب: `مسح الكل` وسيبدأ البوت فوراً بمسح جميع رسائلك بالكامل."
+            "• اكتب في المحادثة أو القروب: `مسح الكل` وسيبدأ البوت فوراً بمسح جميع رسائلِك بالكامل."
         )
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"purge_menu")]])
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
 
-    # ==================== Tastir Submenu & Delete logic ====================
     elif data == b"tastir_menu":
         await event.edit("📝 **قائمة التسطير:**\nيرجى تحديد الخيار المطلوب:", buttons=tastir_menu_keyboard(user_id))
 
@@ -842,10 +1096,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا توجد جمل مضافة لحذفها.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_tastir_item"}
-        txt = "📋 **اضغط على أي جملة بالأسفل لنسخها فوراً، ثم أرسلها للبوت لحذفها:**\n\n"
+        txt = "📋 **أرسل الجملة التي تريد حذفها الآن:**\n\n"
         for p in phrases:
             txt += f"• `{p}`\n"
-        txt += "\n✏️ أرسل الجملة التي تريد حذفها الآن (يمكنك حذف عدة جمل متتالية):"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
 
     elif data == b"clear_tastir":
@@ -884,7 +1137,6 @@ async def callback_handler(event):
         await event.answer("❌ تم حذف جميع أوامر إيقاف التسطير.", alert=True)
         await event.edit("📝 **قائمة التسطير:**", buttons=tastir_menu_keyboard(user_id))
 
-    # ==================== Fardiyyat Submenu & Delete logic ====================
     elif data == b"fardiyyat_menu":
         await event.edit("🎯 **قائمة الفرديات:**\nيرجى تحديد الخيار المطلوب:", buttons=fardiyyat_menu_keyboard(user_id))
 
@@ -921,10 +1173,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا توجد كلمات مضافة لحذفها.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_fardiyyat_item"}
-        txt = "📋 **اضغط على أي كلمة بالأسفل لنسخها فوراً، ثم أرسلها للبوت لحذفها:**\n\n"
+        txt = "📋 **أرسل الكلمة التي تريد حذفها الآن:**\n\n"
         for p in phrases:
             txt += f"• `{p}`\n"
-        txt += "\n✏️ أرسل الكلمة التي تريد حذفها الآن (يمكنك حذف عدة كلمات متتالية):"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
 
     elif data == b"clear_fardiyyat":
@@ -963,9 +1214,18 @@ async def callback_handler(event):
         await event.answer("❌ تم حذف جميع أوامر إيقاف الفرديات.", alert=True)
         await event.edit("🎯 **قائمة الفرديات:**", buttons=fardiyyat_menu_keyboard(user_id))
 
-    # ==================== Reply Submenu & Delete logic ====================
     elif data == b"reply_menu":
         await event.edit("💬 **قائمة الريبلاي:**\nيرجى تحديد الخيار المطلوب:", buttons=reply_menu_keyboard(user_id))
+
+    elif data == b"tog_rep_tastir":
+        users_db[user_id]["include_tastir_in_reply"] = not users_db[user_id].get("include_tastir_in_reply", True)
+        save_data()
+        await event.edit("💬 **قائمة الريبلاي:**", buttons=reply_menu_keyboard(user_id))
+
+    elif data == b"tog_rep_fardiyyat":
+        users_db[user_id]["include_fardiyyat_in_reply"] = not users_db[user_id].get("include_fardiyyat_in_reply", True)
+        save_data()
+        await event.edit("💬 **قائمة الريبلاي:**", buttons=reply_menu_keyboard(user_id))
 
     elif data == b"tog_reply_start":
         users_db[user_id]["del_reply_start"] = not users_db[user_id].get("del_reply_start", True)
@@ -983,10 +1243,19 @@ async def callback_handler(event):
 
     elif data == b"show_reply":
         r_phrases = users_db[user_id].get("reply", [])
-        t_phrases = users_db[user_id].get("tastir", [])
-        f_phrases = users_db[user_id].get("fardiyyat", [])
-        all_phrases = r_phrases + t_phrases + f_phrases
-        txt = "📋 **قائمة جمل الريبلاي (تتضمن التسطير والفرديات تلقائياً):**\n\n" + ("\n".join([f"• `{p}`" for p in all_phrases]) if all_phrases else "لا توجد جمل مضافة.")
+        t_phrases = users_db[user_id].get("tastir", []) + default_tastir
+        f_phrases = users_db[user_id].get("fardiyyat", []) + default_fardiyyat
+        
+        inc_t = users_db[user_id].get("include_tastir_in_reply", True)
+        inc_f = users_db[user_id].get("include_fardiyyat_in_reply", True)
+        
+        all_phrases = list(r_phrases + default_reply)
+        if inc_t:
+            all_phrases += t_phrases
+        if inc_f:
+            all_phrases += f_phrases
+            
+        txt = "📋 **قائمة جمل الريبلاي (النشطة حالياً حسب خياراتك):**\n\n" + ("\n".join([f"• `{p}`" for p in all_phrases]) if all_phrases else "لا توجد جمل مضافة أو نشطة.")
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
 
     elif data == b"del_reply_sub":
@@ -1003,10 +1272,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا توجد جمل مضافة مخصصة للريبلاي فقط لحذفها.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_reply_item"}
-        txt = "📋 **اضغط على أي جملة بالأسفل لنسخها فوراً، ثم أرسلها للبوت لحذفها من الريبلاي:**\n\n"
+        txt = "📋 **أرسل الجملة التي تريد حذفها من الريبلاي:**\n\n"
         for p in phrases:
             txt += f"• `{p}`\n"
-        txt += "\n✏️ أرسل الجملة التي تريد حذفها الآن:"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
 
     elif data == b"clear_reply":
@@ -1045,7 +1313,6 @@ async def callback_handler(event):
         await event.answer("❌ تم حذف جميع أوامر إيقاف الريبلاي.", alert=True)
         await event.edit("💬 **قائمة الريبلاي:**", buttons=reply_menu_keyboard(user_id))
 
-    # ==================== Mute Submenu & Delete logic ====================
     elif data == b"mute_menu":
         await event.edit("🔇 **قائمة الكتم الشامل:**\nيرجى تحديد الخيار المطلوب:", buttons=mute_menu_keyboard(user_id))
 
@@ -1082,10 +1349,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا توجد أوامر كتم لحذفها.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_mute_cmd_item"}
-        txt = "📋 **اضغط على أي أمر بالأسفل لنسخه فوراً، ثم أرسله للبوت لحذفه:**\n\n"
+        txt = "📋 **أرسل أمر الكتم الذي تريد حذفه الآن:**\n\n"
         for c in cmds:
             txt += f"• `{c}`\n"
-        txt += "\n✏️ أرسل الأمر الذي تريد حذفه الآن:"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif data == b"clear_mute_cmd":
@@ -1117,10 +1383,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا توجد أوامر إلغاء كتم لحذفها.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_unmute_cmd_item"}
-        txt = "📋 **اضغط على أي أمر بالأسفل لنسخه فوراً، ثم أرسله للبوت لحذفه:**\n\n"
+        txt = "📋 **أرسل أمر إلغاء الكتم الذي تريد حذفه الآن:**\n\n"
         for c in cmds:
             txt += f"• `{c}`\n"
-        txt += "\n✏️ أرسل الأمر الذي تريد حذفه الآن:"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif data == b"clear_unmute_cmd":
@@ -1148,10 +1413,9 @@ async def callback_handler(event):
             await event.answer("⚠️ لا يوجد مستخدمون مكتومون.", alert=True)
             return
         user_states[user_id] = {"step": "awaiting_del_muted_user_item"}
-        txt = "📋 **اضغط على آيدي أي مستخدم بالأسفل لنسخه فوراً، ثم أرسله للبوت لإلغاء كتمه:**\n\n"
+        txt = "📋 **أرسل آيدي المستخدم المراد إزالة كتمه الآن:**\n\n"
         for u in m_list:
             txt += f"• `{u}`\n"
-        txt += "\n✏️ أرسل الآيدي المراد إزالة كتمه الآن:"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif data == b"clear_muted_users":
@@ -1160,7 +1424,6 @@ async def callback_handler(event):
         await event.answer("⚠️ تم مسح جميع المكتومين بنجاح.", alert=True)
         await event.edit("🔇 **قائمة الكتم:**", buttons=mute_menu_keyboard(user_id))
 
-    # Speed Callbacks
     elif data == b"speed_menu":
         cur_spd = users_db[user_id]["speed"]
         await event.edit(f"⚡ **ضبط السرعة:**\n⏱️ السرعة الحالية: `{cur_spd}` ثانية", buttons=speed_menu_keyboard())
@@ -1174,12 +1437,65 @@ async def callback_handler(event):
             cur_spd = users_db[user_id]["speed"]
             await event.edit(f"⚡ **ضبط السرعة:**\n⏱️ السرعة الحالية: `{cur_spd}` ثانية", buttons=speed_menu_keyboard())
 
-    # Admin Menu Callbacks
     elif data == b"admin_menu":
         if user_id not in ADMIN_IDS:
             await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
             return
         await event.edit("👑 **لوحة تحكم المسؤول:**", buttons=admin_menu_keyboard())
+
+    elif data == b"admin_tastir_menu" and user_id in ADMIN_IDS:
+        await event.edit("📝 **إدارة التسطير الأساسي (العام):**", buttons=admin_tastir_menu_keyboard())
+
+    elif data == b"add_def_tastir" and user_id in ADMIN_IDS:
+        user_states[user_id] = {"step": "awaiting_add_def_tastir"}
+        await event.edit("➕ أرسل الجملة الأساسية للتسطير (لتنضاف تلقائياً للجميع):", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+
+    elif data == b"show_def_tastir" and user_id in ADMIN_IDS:
+        txt = "📋 **قائمة التسطير الأساسية الحالية:**\n\n" + ("\n".join([f"• `{p}`" for p in default_tastir]) if default_tastir else "لا توجد جمل أساسية مضافة.")
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+
+    elif data == b"del_def_tastir_item_start" and user_id in ADMIN_IDS:
+        if not default_tastir:
+            await event.answer("⚠️ لا توجد جمل أساسية لحذفها.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_del_def_tastir_item"}
+        txt = "📋 **أرسل الجملة الأساسية التي تريد حذفها:**\n\n"
+        for p in default_tastir:
+            txt += f"• `{p}`\n"
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+
+    elif data == b"clear_def_tastir" and user_id in ADMIN_IDS:
+        default_tastir = []
+        save_data()
+        await event.answer("⚠️ تم مسح جميع جمل التسطير الأساسية.", alert=True)
+        await event.edit("📝 **إدارة التسطير الأساسي:**", buttons=admin_tastir_menu_keyboard())
+
+    elif data == b"admin_fardiyyat_menu" and user_id in ADMIN_IDS:
+        await event.edit("🎯 **إدارة الفرديات الأساسية (العامة):**", buttons=admin_fardiyyat_menu_keyboard())
+
+    elif data == b"add_def_fardiyyat" and user_id in ADMIN_IDS:
+        user_states[user_id] = {"step": "awaiting_add_def_fardiyyat"}
+        await event.edit("➕ أرسل الكلمة الأساسية للفرديات (لتنضاف تلقائياً للجميع):", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+
+    elif data == b"show_def_fardiyyat" and user_id in ADMIN_IDS:
+        txt = "📋 **قائمة الفرديات الأساسية الحالية:**\n\n" + ("\n".join([f"• `{p}`" for p in default_fardiyyat]) if default_fardiyyat else "لا توجد كلمات أساسية مضافة.")
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+
+    elif data == b"del_def_fardiyyat_item_start" and user_id in ADMIN_IDS:
+        if not default_fardiyyat:
+            await event.answer("⚠️ لا توجد كلمات أساسية لحذفها.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_del_def_fardiyyat_item"}
+        txt = "📋 **أرسل الكلمة الأساسية التي تريد حذفها:**\n\n"
+        for p in default_fardiyyat:
+            txt += f"• `{p}`\n"
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+
+    elif data == b"clear_def_fardiyyat" and user_id in ADMIN_IDS:
+        default_fardiyyat = []
+        save_data()
+        await event.answer("⚠️ تم مسح جميع كلمات الفرديات الأساسية.", alert=True)
+        await event.edit("🎯 **إدارة الفرديات الأساسية:**", buttons=admin_fardiyyat_menu_keyboard())
 
     elif data == b"broadcast_start" and user_id in ADMIN_IDS:
         user_states[user_id] = {"step": "awaiting_broadcast_msg"}
@@ -1245,6 +1561,7 @@ async def callback_handler(event):
 # ==================== Text & Media Input Handlers ====================
 @bot.on(events.NewMessage)
 async def message_input_handler(event):
+    global default_tastir, default_fardiyyat, default_reply
     if not event.is_private or (event.text and event.text.startswith("/")):
         return
 
@@ -1256,8 +1573,56 @@ async def message_input_handler(event):
     step = state.get("step")
     text = event.raw_text.strip() if event.raw_text else ""
 
-    # 1. تفعيل كود الاشتراك
-    if step == "awaiting_code_input":
+    if step == "awaiting_add_def_tastir" and user_id in ADMIN_IDS:
+        default_tastir.append(text)
+        save_data()
+        await event.respond("✅ تم إضافة الجملة الأساسية للتسطير بنجاح وتحديثها للجميع.\n\nيمكنك إرسال جملة أخرى أو الضغط على رجوع:", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+        return
+
+    elif step == "awaiting_del_def_tastir_item" and user_id in ADMIN_IDS:
+        if text in default_tastir:
+            default_tastir.remove(text)
+            save_data()
+            await event.respond(f"✅ تم حذف الجملة الأساسية: `{text}` بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+        else:
+            await event.respond("❌ الجملة غير موجودة في التسطير الأساسي، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
+        return
+
+    elif step == "awaiting_add_def_fardiyyat" and user_id in ADMIN_IDS:
+        default_fardiyyat.append(text)
+        save_data()
+        await event.respond("✅ تم إضافة الكلمة الأساسية للفرديات بنجاح وتحديثها للجميع.\n\nيمكنك إرسال كلمة أخرى أو الضغط على رجوع:", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+        return
+
+    elif step == "awaiting_del_def_fardiyyat_item" and user_id in ADMIN_IDS:
+        if text in default_fardiyyat:
+            default_fardiyyat.remove(text)
+            save_data()
+            await event.respond(f"✅ تم حذف الكلمة الأساسية: `{text}` بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+        else:
+            await event.respond("❌ الكلمة غير موجودة في الفرديات الأساسية، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
+        return
+
+    elif step == "awaiting_bot_response":
+        if user_id not in ADMIN_IDS:
+            return
+        users_db[user_id]["bot_responses"].append(text)
+        save_data()
+        await event.respond("✅ تم إضافة الكلمة والرد الخاص بها إلى قائمة (ردود البوت) بنجاح.\n\nيمكنك إرسال كلمة أخرى، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+        return
+
+    elif step == "awaiting_del_bot_response_item":
+        if user_id not in ADMIN_IDS:
+            return
+        if text in users_db[user_id]["bot_responses"]:
+            users_db[user_id]["bot_responses"].remove(text)
+            save_data()
+            await event.respond(f"✅ تم حذف الكلمة/الرد: `{text}` بنجاح.\n\nأرسل كلمة أخرى لحذفها، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+        else:
+            await event.respond("❌ الكلمة غير موجودة بالقائمة، تأكد منها ثم أرسلها مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"bot_responses_menu")]])
+        return
+
+    elif step == "awaiting_code_input":
         success, days = await apply_activation_code(user_id, text, event)
         user_states.pop(user_id, None)
         if success:
@@ -1265,7 +1630,6 @@ async def message_input_handler(event):
         else:
             await event.respond("❌ رمز التفعيل غير صالح أو تم استخدامه سابقاً.")
 
-    # 2. إدخال رقم الهاتف
     elif step == "awaiting_phone":
         phone = text.replace(" ", "")
         msg = await event.respond("⏳ جاري إرسال كود التحقق...")
@@ -1289,7 +1653,6 @@ async def message_input_handler(event):
             user_states.pop(user_id, None)
             await msg.edit(f"❌ حدث خطأ أثناء إرسال الكود:\n`{e}`\n\nتأكد من كتابة الرقم بشكل صحيح مع رمز الدولة ثم حاول مجدداً.")
 
-    # 3. إدخال كود OTP
     elif step == "awaiting_code":
         code = text.replace(" ", "").replace("-", "")
         client = state.get("client")
@@ -1312,7 +1675,6 @@ async def message_input_handler(event):
         except Exception as e:
             await msg.edit(f"❌ رمز التحقق غير صحيح أو منتهي الصلاحية:\n`{e}`\n\nأعد إرسال الكود الصحيح:")
 
-    # 4. إدخال كلمة مرور 2FA
     elif step == "awaiting_password":
         password = text
         client = state.get("client")
@@ -1326,7 +1688,6 @@ async def message_input_handler(event):
         except Exception as e:
             await msg.edit(f"❌ كلمة المرور غير صحيحة:\n`{e}`\n\nيرجى إرسال كلمة المرور الصحيحة مرة أخرى:")
 
-    # 5. الصوتيات
     elif step == "awaiting_voice":
         if event.voice or event.audio:
             next_num = get_next_voice_number(user_id)
@@ -1337,11 +1698,10 @@ async def message_input_handler(event):
             user_states.pop(user_id, None)
             await event.respond(f"✅ تم حفظ الصوتية بنجاح برقم: `{next_num}`", buttons=[[Button.inline("🔙 رجوع", b"voice_menu")]])
 
-    # ==================== الإضافة المستمرة ====================
     elif step == "awaiting_tastir":
         users_db[user_id]["tastir"].append(text)
         save_data()
-        await event.respond("✅ تم إضافة الجملة إلى التسطير بنجاح (وستتوفر تلقائياً في الريبلاي).\n\nيمكنك إرسال جملة أخرى، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
+        await event.respond("✅ تم إضافة الجملة إلى التسطير بنجاح (وستتوفر تلقائياً في الريبلاي حسب تفعيلك).\n\nيمكنك إرسال جملة أخرى، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
 
     elif step == "awaiting_tastir_start":
         if check_cmd_exists(user_id, text):
@@ -1359,7 +1719,7 @@ async def message_input_handler(event):
     elif step == "awaiting_fardiyyat":
         users_db[user_id]["fardiyyat"].append(text)
         save_data()
-        await event.respond("✅ تم إضافة الكلمة إلى الفرديات بنجاح (وستتوفر تلقائياً في الريبلاي).\n\nيمكنك إرسال كلمة أخرى، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
+        await event.respond("✅ تم إضافة الكلمة إلى الفرديات بنجاح (وستتوفر تلقائياً في الريبلاي حسب تفعيلك).\n\nيمكنك إرسال كلمة أخرى، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
 
     elif step == "awaiting_fardiyyat_start":
         if check_cmd_exists(user_id, text):
@@ -1393,186 +1753,178 @@ async def message_input_handler(event):
         await event.respond("✅ تم إضافة أمر إيقاف الريبلاي بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
 
     elif step == "awaiting_mute_cmd":
-        if check_cmd_exists(user_id, text):
-            await event.respond("⚠️ هذا الأمر مستخدم بالفعل في مكان آخر.")
-        else:
-            users_db[user_id]["mute_cmds"].append(text)
-            save_data()
-            await event.respond("✅ تم إضافة أمر الكتم بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+        users_db[user_id]["mute_cmds"].append(text)
+        save_data()
+        await event.respond("✅ تم إضافة أمر الكتم بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif step == "awaiting_unmute_cmd":
-        if check_cmd_exists(user_id, text):
-            await event.respond("⚠️ هذا الأمر مستخدم بالفعل في مكان آخر.")
-        else:
-            users_db[user_id]["unmute_cmds"].append(text)
-            save_data()
-            await event.respond("✅ تم إضافة أمر إلغاء الكتم بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+        users_db[user_id]["unmute_cmds"].append(text)
+        save_data()
+        await event.respond("✅ تم إضافة أمر إلغاء الكتم بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
-    # ==================== الحذف المحدد المستمر ====================
     elif step == "awaiting_del_tastir_item":
         if text in users_db[user_id]["tastir"]:
             users_db[user_id]["tastir"].remove(text)
             save_data()
-            await event.respond(f"✅ تم حذف الجملة: `{text}` بنجاح.\n\nأرسل جملة أخرى لحذفها، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
+            await event.respond(f"✅ تم حذف الجملة: `{text}` بنجاح.\n\nأرسل جملة أخرى لحذفها، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
         else:
-            await event.respond("❌ الجملة غير موجودة بالقائمة، تأكد منها ثم أرسلها مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
+            await event.respond("❌ الجملة غير موجودة، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
 
     elif step == "awaiting_del_fardiyyat_item":
         if text in users_db[user_id]["fardiyyat"]:
             users_db[user_id]["fardiyyat"].remove(text)
             save_data()
-            await event.respond(f"✅ تم حذف الكلمة: `{text}` بنجاح.\n\nأرسل كلمة أخرى لحذفها، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
+            await event.respond(f"✅ تم حذف الكلمة: `{text}` بنجاح.\n\nأرسل كلمة أخرى لحذفها، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
         else:
-            await event.respond("❌ الكلمة غير موجودة بالقائمة، تأكد منها ثم أرسلها مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
+            await event.respond("❌ الكلمة غير موجودة، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
 
     elif step == "awaiting_del_reply_item":
         if text in users_db[user_id]["reply"]:
             users_db[user_id]["reply"].remove(text)
             save_data()
-            await event.respond(f"✅ تم حذف النص: `{text}` من قائمة الريبلاي بنجاح.\n\nأرسل نصاً آخر لحذفه، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
+            await event.respond(f"✅ تم حذف الجملة: `{text}` بنجاح.\n\nأرسل جملة أخرى لحذفها، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
         else:
-            await event.respond("❌ النص غير موجود في جمل الريبلاي المخصصة، أرسله مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
+            await event.respond("❌ الجملة غير موجودة، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"reply_menu")]])
 
     elif step == "awaiting_del_mute_cmd_item":
         if text in users_db[user_id]["mute_cmds"]:
             users_db[user_id]["mute_cmds"].remove(text)
             save_data()
-            await event.respond(f"✅ تم حذف أمر الكتم: `{text}` بنجاح.\n\nأرسل أمراً آخر لحذفه، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+            await event.respond(f"✅ تم حذف أمر الكتم: `{text}` بنجاح.\n\nأرسل أمراً آخر لحذفه، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
         else:
-            await event.respond("❌ الأمر غير موجود بالقائمة، تأكد منه ثم حاول مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+            await event.respond("❌ الأمر غير موجود، تأكد منه ثم أرسله مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif step == "awaiting_del_unmute_cmd_item":
         if text in users_db[user_id]["unmute_cmds"]:
             users_db[user_id]["unmute_cmds"].remove(text)
             save_data()
-            await event.respond(f"✅ تم حذف أمر إلغاء الكتم: `{text}` بنجاح.\n\nأرسل أمراً آخر لحذفه، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+            await event.respond(f"✅ تم حذف أمر إلغاء الكتم: `{text}` بنجاح.\n\nأرسل أمراً آخر لحذفه، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
         else:
-            await event.respond("❌ الأمر غير موجود بالقائمة، تأكد منه ثم حاول مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+            await event.respond("❌ الأمر غير موجود، تأكد منه ثم أرسله مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
     elif step == "awaiting_del_muted_user_item":
-        if text.isdigit() and int(text) in users_db[user_id]["muted_users"]:
-            users_db[user_id]["muted_users"].remove(int(text))
-            save_data()
-            await event.respond(f"✅ تم إلغاء كتم المستخدم: `{text}` بنجاح.\n\nأرسل آيدي آخر لإلغاء كتمه، أو اضغط زر الرجوع للإنهاء:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
-        else:
-            await event.respond("❌ المعرف (ID) غير موجود بقائمة المكتومين، حاول مجدداً أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+        try:
+            uid_to_unmute = int(text)
+            if uid_to_unmute in users_db[user_id]["muted_users"]:
+                users_db[user_id]["muted_users"].remove(uid_to_unmute)
+                save_data()
+                await event.respond(f"✅ تم إزالة كتم المستخدم `{uid_to_unmute}` بنجاح.\n\nأرسل آيدي آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+            else:
+                await event.respond("❌ الآيدي غير موجود في قائمة المكتومين:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
+        except ValueError:
+            await event.respond("❌ يرجى إرسال آيدي رقمي صحيح:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
-    elif step == "awaiting_del_voice_num":
-        v_dict = users_db[user_id].get("voices", {})
-        if text in v_dict:
-            path = v_dict.pop(text)
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-            save_data()
-            user_states.pop(user_id, None)
-            await event.respond(f"✅ تم حذف الصوتية رقم `{text}` بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"voice_menu")]])
-        else:
-            await event.respond("❌ رقم الصوتية غير موجود، يرجى التأكد وإرسال الرقم من جديد:")
+    elif step == "awaiting_broadcast_msg":
+        if user_id not in ADMIN_IDS:
+            return
+        user_states.pop(user_id, None)
+        msg_to_send = event.raw_text
+        sent_count = 0
+        fail_count = 0
+        
+        status_msg = await event.respond("⏳ جاري بدء الإذاعة لجميع المستخدمين...")
+        for uid in list(users_db.keys()):
+            try:
+                await bot.send_message(uid, f"📢 **إشعار هام من الإدارة:**\n\n{msg_to_send}")
+                sent_count += 1
+                await asyncio.sleep(0.1)
+            except Exception:
+                fail_count += 1
+                
+        await status_msg.edit(f"✅ **تمت الإذاعة بنجاح!**\n\n• تم الإرسال إلى: `{sent_count}` مستخدم\n• فشل الإرسال إلى: `{fail_count}` مستخدم", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    # 7. أوامر لوحة تحكم المسؤول
-    elif step == "awaiting_code_days" and user_id in ADMIN_IDS:
-        if text.isdigit():
+    elif step == "awaiting_code_days":
+        if user_id not in ADMIN_IDS:
+            return
+        try:
             days = int(text)
-            code = "PABLO-" + secrets.token_hex(4).upper()
+            code = secrets.token_hex(4)
             activation_codes[code] = days
             save_data()
             user_states.pop(user_id, None)
-            bot_info = await bot.get_me()
-            deep_link = f"https://t.me/{bot_info.username}?start={code}"
-            txt = (
-                f"🎟️ **تم توليد رمز الاشتراك بنجاح:**\n\n"
-                f"• الرمز: `{code}`\n"
-                f"• المدة: {days} يوم\n\n"
-                f"🔗 **رابط التفعيل المباشر:**\n{deep_link}"
+            await event.respond(
+                f"✅ **تم توليد كود الاشتراك بنجاح!**\n\n"
+                f"• الكود: `{code}`\n"
+                f"• المدة: `{days}` يوم\n\n"
+                f"رابط التفعيل المباشر:\n`https://t.me/{(await bot.get_me()).username}?start={code}`",
+                buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]]
             )
-            await event.respond(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
-        else:
-            await event.respond("❌ يرجى إرسال عدد الأيام كأرقام فقط (مثال: `30`).")
+        except ValueError:
+            await event.respond("❌ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif step == "awaiting_broadcast_msg" and user_id in ADMIN_IDS:
+    elif step == "awaiting_revoke_user_id":
+        if user_id not in ADMIN_IDS:
+            return
         user_states.pop(user_id, None)
-        msg = await event.respond("⏳ جاري إرسال الإذاعة لجميع المستخدمين...")
-        count = 0
-        for u_id in list(users_db.keys()):
-            try:
-                await bot.send_message(u_id, text)
-                count += 1
-            except Exception:
-                pass
-        await msg.edit(f"✅ تم إرسال الإذاعة بنجاح إلى `{count}` مستخدم.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
-
-    elif step == "awaiting_revoke_user_id" and user_id in ADMIN_IDS:
-        if text.isdigit():
+        try:
             target_uid = int(text)
             if target_uid in users_db:
                 users_db[target_uid]["expires_at"] = 0
-                stop_running_task(target_uid)
                 save_data()
-                user_states.pop(user_id, None)
-                await event.respond(f"✅ تم إلغاء اشتراك المستخدم (`{target_uid}`) وتصفير حسابه وإيقاف مهامه بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+                await event.respond(f"✅ تم إلغاء اشتراك المستخدم `{target_uid}` وتصفير مدته بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             else:
-                await event.respond("❌ هذا المعرف غير مسجل في قاعدة البيانات.")
-        else:
-            await event.respond("❌ يرجى إرسال آيدي صحيح (أرقام فقط).")
+                await event.respond("❌ المستخدم غير مسجل في قاعدة البيانات.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        except ValueError:
+            await event.respond("❌ يرجى إرسال آيدي رقمي صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif step == "awaiting_new_admin_id" and user_id in ADMIN_IDS:
-        if text.isdigit():
-            new_aid = int(text)
-            if new_aid not in ADMIN_IDS:
-                ADMIN_IDS.append(new_aid)
+    elif step == "awaiting_new_admin_id":
+        if user_id not in ADMIN_IDS:
+            return
+        user_states.pop(user_id, None)
+        try:
+            new_admin = int(text)
+            if new_admin not in ADMIN_IDS:
+                ADMIN_IDS.append(new_admin)
+                init_user_db(new_admin)
+                users_db[new_admin]["expires_at"] = time.time() + (100 * 365 * 86400)
                 save_data()
-                user_states.pop(user_id, None)
-                await event.respond(f"✅ تم إضافة المسؤول (`{new_aid}`) بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+                await event.respond(f"✅ تم ترقية المستخدم `{new_admin}` إلى مسؤول بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             else:
-                await event.respond("⚠️ هذا المستخدم مسؤول بالفعل.")
-        else:
-            await event.respond("❌ يرجى إرسال آيدي صحيح (أرقام فقط).")
+                await event.respond("⚠️ المستخدم مسؤول بالفعل.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        except ValueError:
+            await event.respond("❌ يرجى إرسال آيدي رقمي صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif step == "awaiting_delete_admin_id" and user_id in ADMIN_IDS:
-        if text.isdigit():
-            del_aid = int(text)
-            if del_aid in ADMIN_IDS:
-                ADMIN_IDS.remove(del_aid)
+    elif step == "awaiting_delete_admin_id":
+        if user_id not in ADMIN_IDS:
+            return
+        user_states.pop(user_id, None)
+        try:
+            del_admin = int(text)
+            if del_admin in ADMIN_IDS:
+                if len(ADMIN_IDS) <= 1:
+                    await event.respond("⚠️ لا يمكنك حذف المسؤول الوحيد للنظام.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+                    return
+                ADMIN_IDS.remove(del_admin)
                 save_data()
-                user_states.pop(user_id, None)
-                await event.respond(f"✅ تم حذف المسؤول (`{del_aid}`) بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+                await event.respond(f"✅ تم إزالة المستخدم `{del_admin}` من قائمة المسؤولين بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             else:
-                await event.respond("❌ هذا الآيدي ليس ضمن قائمة المسؤولين.")
-        else:
-            await event.respond("❌ يرجى إرسال آيدي صحيح (أرقام فقط).")
+                await event.respond("⚠️ المستخدم ليس مسؤولاً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        except ValueError:
+            await event.respond("❌ يرجى إرسال آيدي رقمي صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-# ==================== Auto-Reconnect Saved Userbots ====================
-async def load_and_start_user_clients():
-    for user_id in list(users_db.keys()):
-        session_file = f"{SESSIONS_DIR}/user_{user_id}.session"
-        if os.path.exists(session_file):
+# ==================== Initialization & Run ====================
+async def main():
+    print("Starting bot...")
+    await bot.start(bot_token=BOT_TOKEN)
+    print("Bot is running...")
+    
+    for uid, uinfo in list(users_db.items()):
+        session_path = f"{SESSIONS_DIR}/user_{uid}"
+        if os.path.exists(f"{session_path}.session"):
             try:
-                client = TelegramClient(f"{SESSIONS_DIR}/user_{user_id}", API_ID, API_HASH)
+                client = TelegramClient(session_path, API_ID, API_HASH)
                 await client.connect()
                 if await client.is_user_authorized():
-                    user_clients[user_id] = client
-                    await register_userbot_events(client, user_id)
-                    print(f"✅ Connected userbot session for ID: {user_id}")
-                else:
-                    await client.disconnect()
+                    user_clients[uid] = client
+                    await register_userbot_events(client, uid)
+                    print(f"Restored session for user {uid}")
             except Exception as e:
-                print(f"❌ Could not load session for user {user_id}: {e}")
+                print(f"Failed to restore session for {uid}: {e}")
 
-# ==================== Main Runner ====================
-async def main():
-    global manager_bot_id
-    await bot.start(bot_token=BOT_TOKEN)
-    me_bot = await bot.get_me()
-    manager_bot_id = me_bot.id
-    print(f"Bot started as @{me_bot.username} (ID: {manager_bot_id})")
-    
-    # استعادة الاتصال بكافة الحسابات المربوطة فور تشغيل البوت
-    await load_and_start_user_clients()
-    
-    await bot.run_until_disconnected()
+    await bot.disconnected
 
 if __name__ == "__main__":
-    bot.loop.run_until_complete(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
