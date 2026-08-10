@@ -1,28 +1,28 @@
 import os
-import telebot
-from pymongo import MongoClient
-
-client = MongoClient(os.getenv("MONGO_URI"))
-db = client["pablo_bot_db"]
-users_collection = db["users"]
-
 import asyncio
-import os
 import random
 import secrets
 import time
 import json
 import re
 import yt_dlp
+from pymongo import MongoClient
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError
+
+# ==================== MongoDB Configuration ====================
+MONGO_URI = os.getenv("MONGO_URI")
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["pablo_bot_db"]
+users_collection = db["users"]
+settings_collection = db["settings"]
 
 # ==================== Configuration ====================
 API_ID = 39686732
 API_HASH = "4ccd261405e1fe78120b5e0a0efe48a7"
 BOT_TOKEN = "8619643812:AAGN80E9HP0F_PePe45QCvs4MS6HawNnYNI"
 
-# آيدي بوت الإدارة لمنع التداخل (تم وضعه هنا)
+# آيدي بوت الإدارة لمنع التداخل
 manager_bot_id = 8619643812
 
 # قائمة المسؤولين (المطور الأساسي)
@@ -32,8 +32,7 @@ ADMIN_IDS = [520859814]
 DEV_URL = "https://t.me/Nardouv"
 CHANNEL_URL = "https://t.me/PabloBot666"
 
-# ملف حفظ البيانات ومجلد الصوتيات والجلسات
-DATA_FILE = "bot_data.json"
+# مجلد الصوتيات والجلسات
 VOICES_DIR = "voices"
 SESSIONS_DIR = "sessions"
 
@@ -74,39 +73,50 @@ running_tasks = {}
 
 bot = TelegramClient("manager_bot_session", API_ID, API_HASH)
 
-# ==================== Persistence Functions ====================
+# ==================== MongoDB Persistence Functions ====================
 def save_data():
     try:
-        data = {
+        global_data = {
             "default_tastir": default_tastir,
             "default_fardiyyat": default_fardiyyat,
             "default_reply": default_reply,
-            "users_db": users_db,
             "activation_codes": activation_codes,
             "admin_ids": ADMIN_IDS
         }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        settings_collection.update_one(
+            {"_id": "global_data"},
+            {"$set": global_data},
+            upsert=True
+        )
+        
+        for uid, udata in users_db.items():
+            users_collection.update_one(
+                {"_id": uid},
+                {"$set": {"data": udata}},
+                upsert=True
+            )
     except Exception as e:
-        print(f"Error saving data: {e}")
+        print(f"Error saving data to MongoDB: {e}")
 
 def load_data():
     global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, ADMIN_IDS
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                default_tastir = data.get("default_tastir", [])
-                default_fardiyyat = data.get("default_fardiyyat", [])
-                default_reply = data.get("default_reply", [])
-                raw_users = data.get("users_db", {})
-                users_db = {int(k): v for k, v in raw_users.items()}
-                activation_codes = data.get("activation_codes", {})
-                loaded_admins = data.get("admin_ids", None)
-                if loaded_admins:
-                    ADMIN_IDS = [int(a) for a in loaded_admins]
-        except Exception as e:
-            print(f"Error loading data: {e}")
+    try:
+        global_doc = settings_collection.find_one({"_id": "global_data"})
+        if global_doc:
+            default_tastir = global_doc.get("default_tastir", [])
+            default_fardiyyat = global_doc.get("default_fardiyyat", [])
+            default_reply = global_doc.get("default_reply", [])
+            activation_codes = global_doc.get("activation_codes", {})
+            loaded_admins = global_doc.get("admin_ids", None)
+            if loaded_admins:
+                ADMIN_IDS = [int(a) for a in loaded_admins]
+        
+        users_db = {}
+        for doc in users_collection.find():
+            uid = int(doc["_id"])
+            users_db[uid] = doc.get("data", {})
+    except Exception as e:
+        print(f"Error loading data from MongoDB: {e}")
 
 load_data()
 
@@ -412,7 +422,6 @@ async def resolve_target_user(event):
 async def register_userbot_events(client_inst, owner_id):
     @client_inst.on(events.NewMessage)
     async def userbot_handler(event):
-        # تجاهل تام لأي رسالة صادرة من البوت أو مرسلة إليه لمنع التداخل
         if manager_bot_id and (event.chat_id == manager_bot_id or event.sender_id == manager_bot_id):
             return
 
@@ -1913,7 +1922,7 @@ async def message_input_handler(event):
 
 # ==================== Initialization & Run ====================
 async def main():
-    print("Starting bot...")
+    print("Starting bot with MongoDB persistence...")
     await bot.start(bot_token=BOT_TOKEN)
     print("Bot is running...")
     
