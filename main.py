@@ -14,6 +14,9 @@ API_ID = 39686732
 API_HASH = "4ccd261405e1fe78120b5e0a0efe48a7"
 BOT_TOKEN = "8619643812:AAGN80E9HP0F_PePe45QCvs4MS6HawNnYNI"
 
+# آيدي بوت الإدارة لمنع التداخل (تم وضعه هنا)
+manager_bot_id = 8619643812
+
 # قائمة المسؤولين (المطور الأساسي)
 ADMIN_IDS = [520859814]
 
@@ -30,9 +33,6 @@ if not os.path.exists(VOICES_DIR):
     os.makedirs(VOICES_DIR)
 if not os.path.exists(SESSIONS_DIR):
     os.makedirs(SESSIONS_DIR)
-
-# آيدي بوت الإدارة لمنع التداخل
-manager_bot_id = None
 
 # خريطة السرعة بالثواني
 SPEED_MAP = {
@@ -404,7 +404,8 @@ async def resolve_target_user(event):
 async def register_userbot_events(client_inst, owner_id):
     @client_inst.on(events.NewMessage)
     async def userbot_handler(event):
-        if manager_bot_id and event.chat_id == manager_bot_id:
+        # تجاهل تام لأي رسالة صادرة من البوت أو مرسلة إليه لمنع التداخل
+        if manager_bot_id and (event.chat_id == manager_bot_id or event.sender_id == manager_bot_id):
             return
 
         chat_id = event.chat_id
