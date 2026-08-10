@@ -1,3 +1,2 @@
 telethon
 yt_dlp
-pymongo[srv]
