@@ -1,3 +1,11 @@
+import os
+import telebot
+from pymongo import MongoClient
+
+client = MongoClient(os.getenv("MONGO_URI"))
+db = client["pablo_bot_db"]
+users_collection = db["users"]
+
 import asyncio
 import os
 import random
