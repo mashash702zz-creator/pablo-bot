@@ -1,2 +1,4 @@
 telethon
-yt_dlp
+yt-dlp
+requests
+pillow
