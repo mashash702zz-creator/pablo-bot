@@ -89,6 +89,7 @@ running_tasks = {}
 auto_publish_tasks = {}
 broadcast_tasks = {}
 calculator_sessions = {}
+publish_stop_reasons = {}
 
 # جلسة مستقلة للبوت؛ تمنع استخدام جلسة حساب شخصي قديمة بدل بوت الإدارة.
 bot = TelegramClient("manager_bot_8617294862", API_ID, API_HASH)
@@ -175,11 +176,11 @@ async def remove_user_completely(user_id, reason="حذف"):
     if user_id in ADMIN_IDS:
         return False
     stop_running_task(user_id)
-    stop_auto_publish_task(user_id)
+    client = user_clients.pop(user_id, None)
+    await stop_auto_publish_task(client, user_id, reason="تم إيقاف النشر بسبب انتهاء أو حذف الاشتراك")
     for key, task in list(broadcast_tasks.items()):
         if key == user_id and task and not task.done():
             task.cancel()
-    client = user_clients.pop(user_id, None)
     if client:
         try:
             await client.disconnect()
@@ -766,14 +767,31 @@ async def _forward_publish_message(client, target_chat_id, source_message):
     await client.forward_messages(target_chat_id, source_message)
 
 
+async def _publish_target_name(client, target_chat_id):
+    try:
+        entity = await client.get_entity(target_chat_id)
+        return getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(target_chat_id)
+    except Exception:
+        return str(target_chat_id)
+
+
+async def _send_publish_stop_notice(owner_id, target_name, reason):
+    text = f"• تم إيقاف النشر في {target_name}\n• السبب ← {reason}"
+    try:
+        await bot.send_message(owner_id, text)
+    except Exception:
+        pass
+
+
 async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count):
     task_key = (owner_id, int(target_chat_id))
     old_task = auto_publish_tasks.get(task_key)
     if old_task and not old_task.done():
-        old_task.cancel()
+        await stop_auto_publish_task(client, owner_id, target_chat_id, "تم استبدال عملية النشر بعملية جديدة")
 
     async def publish_loop():
         completed = 0
+        target_name = await _publish_target_name(client, target_chat_id)
         try:
             while completed < count:
                 await _forward_publish_message(client, target_chat_id, source_message)
@@ -781,29 +799,29 @@ async def start_auto_publish_task(client, owner_id, target_chat_id, source_messa
                 if completed < count:
                     await asyncio.sleep(delay)
         except asyncio.CancelledError:
+            reason = publish_stop_reasons.pop(task_key, "تم إيقاف النشر يدوياً")
+            await _send_publish_stop_notice(owner_id, target_name, reason)
             raise
         except Exception as e:
-            try:
-                await bot.send_message(owner_id, f"❌ توقفت عملية النشر في `{target_chat_id}` بسبب:\n`{e}`")
-            except Exception:
-                pass
+            await _send_publish_stop_notice(owner_id, target_name, str(e))
         finally:
             auto_publish_tasks.pop(task_key, None)
+            publish_stop_reasons.pop(task_key, None)
 
     task = asyncio.create_task(publish_loop())
     auto_publish_tasks[task_key] = task
     return task_key
 
 
-def stop_auto_publish_task(owner_id, target_chat_id=None):
+async def stop_auto_publish_task(client, owner_id, target_chat_id=None, reason="تم إيقاف النشر يدوياً"):
     stopped = 0
     for key, task in list(auto_publish_tasks.items()):
         task_owner, task_chat = key
         if task_owner == owner_id and (target_chat_id is None or task_chat == int(target_chat_id)):
             if not task.done():
+                publish_stop_reasons[key] = reason
                 task.cancel()
                 stopped += 1
-            auto_publish_tasks.pop(key, None)
     return stopped
 
 
@@ -1866,7 +1884,7 @@ async def register_userbot_events(client_inst, owner_id):
             if text == "بس":
                 if not is_source_subscribed(owner_id):
                     return
-                stopped = stop_auto_publish_task(owner_id, chat_id)
+                stopped = await stop_auto_publish_task(client_inst, owner_id, chat_id, "تم إيقاف النشر يدوياً بواسطة صاحب الحساب")
                 await event.delete()
                 await client_inst.send_message(chat_id, f"✅ تم إيقاف {stopped} عملية نشر في هذا القروب.")
                 return
@@ -1874,7 +1892,7 @@ async def register_userbot_events(client_inst, owner_id):
             if text == "ايقاف النشر":
                 if not is_source_subscribed(owner_id):
                     return
-                stopped = stop_auto_publish_task(owner_id)
+                stopped = await stop_auto_publish_task(client_inst, owner_id, reason="تم إيقاف جميع عمليات النشر يدوياً بواسطة صاحب الحساب")
                 await event.delete()
                 await client_inst.send_message(chat_id, f"✅ تم إيقاف {stopped} عملية نشر.")
                 return
@@ -2677,12 +2695,12 @@ def main_menu_keyboard(user_id):
     tastir_active = is_subscribed(user_id)
     source_active = is_source_subscribed(user_id)
     buttons = []
-    if not tastir_active and not source_active:
-        buttons.extend([
-            [Button.inline("🎟️ كود تفعيل التسطير", b"enter_code_start")],
-            [Button.inline("⭐ كود تفعيل مميزات السورس", b"enter_source_code_start")]
-        ])
-    else:
+    # يبقى زر التفعيل الناقص ظاهراً حتى يفعّل المستخدم الاشتراك الآخر أيضاً.
+    if not tastir_active:
+        buttons.append([Button.inline("🎟️ كود تفعيل التسطير", b"enter_code_start")])
+    if not source_active:
+        buttons.append([Button.inline("⭐ كود تفعيل مميزات السورس", b"enter_source_code_start")])
+    if tastir_active or source_active:
         buttons.append([Button.inline("🔑 تسجيل الدخول / ربط الحساب", b"login_start")])
         if tastir_active:
             buttons.append([Button.inline("📝 قسم التسطير", b"tastir_section")])
@@ -3317,7 +3335,8 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        stopped = stop_auto_publish_task(user_id)
+        client = user_clients.get(user_id)
+        stopped = await stop_auto_publish_task(client, user_id, reason="تم إيقاف جميع عمليات النشر من لوحة التحكم") if client else 0
         await event.answer(f"✅ تم إيقاف {stopped} عملية نشر.", alert=True)
         await event.edit("📍 **قائمة النشر التلقائي:**", buttons=auto_publish_menu_keyboard())
 
