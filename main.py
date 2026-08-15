@@ -183,7 +183,7 @@ def _backup_file_path(prefix="backup"):
 def create_settings_backup():
     """ينشئ نسخة من الإعدادات والاشتراكات والأكواد فقط، دون ملفات جلسات حساسة."""
     save_data()
-    output = _backup_file_path("pablo_backup")
+    output = _backup_file_path("demon_backup")
     shutil.copy2(DATA_FILE, output)
     return output
 
@@ -1042,10 +1042,11 @@ async def get_my_data_report(client, owner_id):
     return text
 
 
-SOURCE_MENU_TITLE = "👨🏻‍💻 | **مرحباً بك عزيزي المستخدم**\n💼 | **قائمة أوامر سورس بوت بابلو**\n⚙️ | **اختر ما تريد من الأزرار أسفل**\n\n♡ **source pablo** 🧸"
+SOURCE_MENU_TITLE = "👨🏻‍💻 | **مرحباً بك عزيزي المستخدم**\n💼 | **قائمة أوامر سورس ديمون**\n⚙️ | **اختر ما تريد من الأزرار أسفل**"
+TASTIR_INLINE_MENU_TITLE = "📝 | **قسم التسطير — ديمون**\n⚙️ | **اختر القسم الذي تريد إدارته من الأزرار أسفل**"
 SOURCE_MENU_FALLBACK = """⚠️ تعذر إرسال قائمة الأزرار المضمّنة.
 
-فعّل Inline Mode لبوت بابلو من @BotFather عبر الأمر `/setinline`، ثم أعد تشغيل البوت وجرب `.الاوامر` مرة أخرى."""
+فعّل Inline Mode لبوت ديمون من @BotFather عبر الأمر `/setinline`، ثم أعد تشغيل البوت وجرب `.الاوامر` مرة أخرى."""
 
 
 # رموز مؤقتة تمنع أي شخص غير صاحب الجلسة من استدعاء قائمة السورس المضمّنة.
@@ -1065,7 +1066,7 @@ async def send_source_commands_menu(client, owner_id, chat_id):
             raise RuntimeError("لا يوجد يوزر لبوت الإدارة")
         token = secrets.token_urlsafe(18)
         inline_source_requests[token] = {"owner_id": owner_id, "expires_at": time.time() + 90}
-        results = await client.inline_query(bot_me.username, f"pablo_source_menu:{token}")
+        results = await client.inline_query(bot_me.username, f"demon_source_menu:{token}")
         if not results:
             inline_source_requests.pop(token, None)
             raise RuntimeError("لم تصل نتيجة القائمة المضمّنة؛ فعّل Inline Mode للبوت من BotFather")
@@ -1077,8 +1078,37 @@ async def send_source_commands_menu(client, owner_id, chat_id):
         print(f"\n[INLINE MENU ERROR] {reason}\n")
         await client.send_message(
             chat_id,
-            f"⚠️ تعذر إظهار قائمة الأزرار عبر @{bot_name}.\n• السبب ← `{reason}`\n\nفعّل Inline Mode لهذا البوت من @BotFather عبر `/setinline` ثم أعد تشغيل البوت."
+            f"⚠️ تعذر إظهار قائمة الأزرار عبر @{bot_name}.\n• السبب ← `{reason}`\n\nتأكد من تشغيل بوت ديمون مرة واحدة فقط ومن تفعيل Inline Mode في @BotFather."
         )
+        return False
+
+
+async def send_tastir_commands_menu(client, owner_id, chat_id):
+    """يعرض قسم التسطير كأزرار عبر بوت ديمون، للحساب المشترك فقط."""
+    try:
+        me = await client.get_me()
+        if me.id != owner_id:
+            raise RuntimeError("جلسة اليوزر بوت لا تطابق صاحب الحساب المرتبط")
+        bot_me = await bot.get_me()
+        if not bot_me.bot or not bot_me.username:
+            raise RuntimeError("بوت الإدارة غير جاهز")
+        token = secrets.token_urlsafe(18)
+        inline_source_requests[token] = {
+            "owner_id": owner_id,
+            "expires_at": time.time() + 90,
+            "menu": "tastir",
+        }
+        results = await client.inline_query(bot_me.username, f"demon_tastir_menu:{token}")
+        if not results:
+            inline_source_requests.pop(token, None)
+            raise RuntimeError("لم تصل نتيجة قائمة التسطير المضمّنة")
+        await results[0].click(chat_id)
+        return True
+    except Exception as e:
+        bot_name = getattr(bot_me, "username", "بوت الإدارة") if "bot_me" in locals() else "بوت الإدارة"
+        reason = f"{type(e).__name__}: {e}"
+        print(f"\n[INLINE TASTIR MENU ERROR] {reason}\n")
+        await client.send_message(chat_id, f"⚠️ تعذر إظهار قائمة التسطير عبر @{bot_name}.\n• السبب ← `{reason}`")
         return False
 
 
@@ -1713,6 +1743,19 @@ async def register_userbot_events(client_inst, owner_id):
             p_cmds = user_info.get("purge_cmds", [])
             p_all_cmds = user_info.get("purge_all_cmds", [])
 
+            # ===== قائمة قسم التسطير: تعمل بالنقطة فقط وتظهر عبر بوت ديمون =====
+            # يوضع هذا الشرط قبل الأوامر القديمة حتى لا يتعارض مع أي أمر تشغيل مخصص باسم «التسطير».
+            if text == ".التسطير":
+                if not is_subscribed(owner_id):
+                    await client_inst.send_message(chat_id, "⚠️ هذه القائمة خاصة بالمشتركين في التسطير. فعّل كود اشتراك التسطير أولاً.")
+                    return
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await send_tastir_commands_menu(client_inst, owner_id, chat_id)
+                return
+
             # ===== الأوامر القديمة: تعمل بالنقطة أو بدونها =====
             # التسطير والفرديات والريبلاي والكتم من مميزات الحساب القديمة، وليست مميزات سورس.
             legacy_text = text[1:].strip() if text.startswith(".") else text.strip()
@@ -2206,7 +2249,7 @@ async def register_userbot_events(client_inst, owner_id):
                     pass
                 try:
                     bot_me = await bot.get_me()
-                    results = await client_inst.inline_query(bot_me.username, "pablo_calculator")
+                    results = await client_inst.inline_query(bot_me.username, "demon_calculator")
                     await results[0].click(chat_id)
                 except Exception as e:
                     await client_inst.send_message(chat_id, f"❌ تعذر عرض الآلة الحاسبة:\n`{e}`")
@@ -3149,7 +3192,7 @@ async def start_handler(event):
     bot_username = me.username or "bot"
 
     welcome_txt = (
-        f"مرحباً بك في بوت [Pablo](https://t.me/{bot_username})\n\n"
+        f"مرحباً بك في بوت [ديمون](https://t.me/{bot_username})\n\n"
         "أزرار التحكم بالأسفل 👇:"
     )
     await event.respond(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
@@ -3192,7 +3235,7 @@ async def callback_handler(event):
         me = await bot.get_me()
         bot_username = me.username or "bot"
         welcome_txt = (
-            f"مرحباً بك في بوت [Pablo](https://t.me/{bot_username})\n\n"
+            f"مرحباً بك في بوت [ديمون](https://t.me/{bot_username})\n\n"
             "أزرار التحكم بالأسفل 👇:"
         )
         try:
@@ -3617,7 +3660,7 @@ async def callback_handler(event):
             return
         try:
             bot_me = await bot.get_me()
-            results = await client.inline_query(bot_me.username, "pablo_calculator")
+            results = await client.inline_query(bot_me.username, "demon_calculator")
             await results[0].click(event.chat_id)
             await event.answer("✅ أرسلت الآلة الحاسبة في هذه المحادثة.", alert=True)
         except Exception as e:
@@ -4517,28 +4560,36 @@ async def callback_handler(event):
 @bot.on(events.InlineQuery)
 async def inline_source_menu_handler(event):
     query = (event.text or "").strip()
-    if query.startswith("pablo_source_menu:"):
+    if query.startswith("demon_source_menu:") or query.startswith("demon_tastir_menu:"):
         token = query.split(":", 1)[1]
         request = inline_source_requests.pop(token, None)
         # لا نعيد أي نتيجة إذا لم تأتِ من الحساب المرتبط الذي طلب القائمة للتو.
         if not request or request.get("expires_at", 0) < time.time() or request.get("owner_id") != event.sender_id:
-            await event.answer([], cache_time=0, is_personal=True)
+            await event.answer([], cache_time=0, private=True)
             return
-        result = event.builder.article(
-            title="مميزات السورس — بوت بابلو",
-            text=SOURCE_MENU_TITLE,
-            buttons=source_features_menu_keyboard(),
-            link_preview=False
-        )
-        await event.answer([result], cache_time=0, is_personal=True)
-    elif query == "pablo_calculator":
+        if request.get("menu") == "tastir":
+            result = event.builder.article(
+                title="قسم التسطير — ديمون",
+                text=TASTIR_INLINE_MENU_TITLE,
+                buttons=tastir_section_keyboard(event.sender_id),
+                link_preview=False
+            )
+        else:
+            result = event.builder.article(
+                title="مميزات السورس — بوت ديمون",
+                text=SOURCE_MENU_TITLE,
+                buttons=source_features_menu_keyboard(),
+                link_preview=False
+            )
+        await event.answer([result], cache_time=0, private=True)
+    elif query == "demon_calculator":
         result = event.builder.article(
             title="الآلة الحاسبة",
             text="📟 **الآلة الحاسبة**\n\n`0`",
             buttons=calculator_keyboard(),
             link_preview=False
         )
-        await event.answer([result], cache_time=0, is_personal=True)
+        await event.answer([result], cache_time=0, private=True)
 
 
 # ==================== Text & Media Input Handlers ====================
