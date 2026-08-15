@@ -763,8 +763,20 @@ async def restore_profile_template(client, owner_id):
     save_data()
 
 
-async def _forward_publish_message(client, target_chat_id, source_message):
-    await client.forward_messages(target_chat_id, source_message)
+async def _publish_message(client, target_chat_id, source_message, forward_mode=False):
+    """ينشر بتحويل صريح أو بنسخ مخفي المصدر افتراضياً."""
+    if forward_mode:
+        await client.forward_messages(target_chat_id, source_message)
+        return
+    from telethon.tl.functions.messages import ForwardMessagesRequest
+    target_peer = await client.get_input_entity(target_chat_id)
+    await client(ForwardMessagesRequest(
+        from_peer=source_message.peer_id,
+        id=[source_message.id],
+        to_peer=target_peer,
+        drop_author=True,
+        random_id=[secrets.randbits(63)]
+    ))
 
 
 async def _publish_target_name(client, target_chat_id):
@@ -783,7 +795,7 @@ async def _send_publish_stop_notice(owner_id, target_name, reason):
         pass
 
 
-async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count):
+async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False):
     task_key = (owner_id, int(target_chat_id))
     old_task = auto_publish_tasks.get(task_key)
     if old_task and not old_task.done():
@@ -794,7 +806,7 @@ async def start_auto_publish_task(client, owner_id, target_chat_id, source_messa
         target_name = await _publish_target_name(client, target_chat_id)
         try:
             while completed < count:
-                await _forward_publish_message(client, target_chat_id, source_message)
+                await _publish_message(client, target_chat_id, source_message, forward_mode)
                 completed += 1
                 if completed < count:
                     await asyncio.sleep(delay)
@@ -1113,16 +1125,23 @@ AUTO_PUBLISH_GUIDE = """⤾ اوامــر النـشــر التـلـقـائ
 ‏⋆————‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 ›————⋆
 
 ← للنشر من داخـل المجمـوعة ↓
- • .نشر + عدد الثواني + عدد المرات
- • .واو + عدد الثواني + عدد المرات
- ↞ بـالـرد علـى الرسالـه المـراد نشرهـا 🚀
+ • .نشر + عدد الثواني + عدد المرات + تحويل
+ • .واو + عدد الثواني + عدد المرات + تحويل
+ ↞ بالـرد علـى الرسالـه المـراد نشرهـا 🚀
+
+↜ ملاحظة مهمة ⚠️
+↞ إذا ما تبي رسالتك تتحول سواء كانت من قناة أو قروب أو حسابك الشخصي أو حساب شخص ما، لا تكتب كلمة تحويل في نهاية الأمر.
+↞ عند كتابة تحويل في نهاية الأمر، سيحوّل النص أو الوسائط كما هي. وإذا كانت المجموعة تمنع تحويل محتوى القنوات أو رفض تيليجرام الإرسال، يتوقف النشر ويصلك السبب.
 
 ← للنشر من خارج المجمـوعة 🔥 ↓
- • .ستارت + عدد الثواني + عدد المرات + ايدي المجموعة
+ • .ستارت + عدد الثواني + عدد المرات + ايدي المجموعة + تحويل
  ↞ بالـرد على الرسالة المـراد نشـرها 🚀
 
+↜ ملاحظة مهمة ⚠️
+↞ كلمة تحويل اختيارية أيضاً في أمر ستارت؛ اتركها للنشر بدون تحويل، أو أضفها آخر الأمر للتحويل الطبيعي.
+
 • ملاحظات هامـه ❕❔
-1 - كـل اوامـر النشـر تدعم الملصقات المميزه ⭐ + تدعـم صـورة واحـدة
+1 - كـل اوامـر النشـر تدعم الملصقات المميزه ⭐ والوسائط حسب ما يسمح به تيليجرام.
 2 - يمكنك الحصـول على ايدي المجموعات من هنا @is_idbot 🤖
 3 - للنشـر بـدون توقـف ضـع عـدد مـرات 999
 
@@ -1846,26 +1865,29 @@ async def register_userbot_events(client_inst, owner_id):
                     await client_inst.send_message(chat_id, "❌ يجب الرد على الرسالة المراد نشرها ثم كتابة الأمر.")
                     return
                 try:
+                    forward_mode = cmd_parts[-1] == "تحويل"
+                    clean_parts = cmd_parts[:-1] if forward_mode else cmd_parts
                     if cmd_first_word in ["نشر", "واو"]:
-                        if len(cmd_parts) != 3:
-                            raise ValueError("الصيغة: `.نشر عدد_الثواني عدد_المرات`")
+                        if len(clean_parts) != 3:
+                            raise ValueError("الصيغة: `.نشر عدد_الثواني عدد_المرات [تحويل]`")
                         target_chat_id = chat_id
-                        delay = float(cmd_parts[1])
-                        count = int(cmd_parts[2])
+                        delay = float(clean_parts[1])
+                        count = int(clean_parts[2])
                     else:
-                        if len(cmd_parts) != 4:
-                            raise ValueError("الصيغة: `.ستارت عدد_الثواني عدد_المرات آيدي_القروب`")
-                        delay = float(cmd_parts[1])
-                        count = int(cmd_parts[2])
-                        target_chat_id = int(cmd_parts[3])
+                        if len(clean_parts) != 4:
+                            raise ValueError("الصيغة: `.ستارت عدد_الثواني عدد_المرات آيدي_القروب [تحويل]`")
+                        delay = float(clean_parts[1])
+                        count = int(clean_parts[2])
+                        target_chat_id = int(clean_parts[3])
                     if delay < 0.5 or count < 1:
                         raise ValueError("أقل مدة مسموحة 0.5 ثانية والعدد يجب أن يكون أكبر من صفر.")
                     if count == 999:
                         count = 10**9
                     reply_message = await event.get_reply_message()
                     await event.delete()
-                    await start_auto_publish_task(client_inst, owner_id, target_chat_id, reply_message, delay, count)
-                    await client_inst.send_message(chat_id, f"✅ بدأ النشر في `{target_chat_id}` كل `{delay}` ثانية.")
+                    await start_auto_publish_task(client_inst, owner_id, target_chat_id, reply_message, delay, count, forward_mode)
+                    mode_text = "بتحويل الرسالة" if forward_mode else "بدون تحويل المصدر"
+                    await client_inst.send_message(chat_id, f"✅ بدأ النشر في `{target_chat_id}` كل `{delay}` ثانية ({mode_text}).")
                 except Exception as e:
                     await client_inst.send_message(chat_id, f"❌ تعذر بدء النشر:\n`{e}`")
                 return
@@ -3313,12 +3335,11 @@ async def callback_handler(event):
     elif data == b"auto_publish_info":
         await event.edit(
             "📖 **أوامر النشر التلقائي:**\n\n"
-            "• بالرد على رسالة في نفس القروب: `.نشر المدة العدد`\n"
-            "• بديل لنفس العملية: `.واو المدة العدد`\n"
-            "• بالرد على رسالة للنشر في قروب آخر: `.ستارت المدة العدد آيدي_القروب`\n"
-            "• `.النشر الشغال` لعرض العمليات.\n"
-            "• `.بس` داخل القروب لإيقاف نشره فقط.\n"
-            "• `.ايقاف النشر` لإيقاف كل عملياتك.\n\n"
+            "• داخل المجموعة: `.نشر المدة العدد تحويل` أو `.واو المدة العدد تحويل` بالرد على الرسالة.\n"
+            "• خارج المجموعة: `.ستارت المدة العدد آيدي_القروب تحويل` بالرد على الرسالة.\n\n"
+            "⚠️ كلمة `تحويل` اختيارية: لا تكتبها للنشر بدون تحويل المصدر، واكتبها في نهاية الأمر للتحويل العادي للنص أو الوسائط.\n"
+            "إذا منعت الوجهة تحويل محتوى القناة أو حدث أي خطأ، يتوقف النشر ويصلك السبب.\n\n"
+            "• `.النشر الشغال` لعرض العمليات.\n• `.بس` لإيقاف نشر القروب الحالي.\n• `.ايقاف النشر` لإيقاف كل عملياتك.\n\n"
             "ضع `999` كعدد للتشغيل الطويل.",
             buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]]
         )
