@@ -2868,7 +2868,7 @@ def source_features_menu_keyboard():
         # الأقسام الجديدة التي تمت إضافتها لاحقاً.
         [Button.inline("👤 الحساب", b"section_account"), Button.inline("📬 الترحيب والردود", b"section_welcome")],
         [Button.inline("🧧 حفظ الذاتية", b"section_self_save"), Button.inline("📍 النشر التلقائي", b"section_publish")],
-        [Button.inline("🎧 البحث والتحميل", b"section_download"), Button.inline("💾 صندوق الأدوات", b"section_tools")],
+        [Button.inline("🎧 البحث والتحميل", b"section_download"), Button.inline("🧰 الأدوات", b"section_tools")],
         [Button.inline("🔙 رجوع", b"main_menu")]
     ]
 
@@ -2877,12 +2877,16 @@ def section_back_keyboard():
     return [[Button.inline("◀️ رجوع", b"source_features_menu")]]
 
 
+def tools_back_keyboard():
+    return [[Button.inline("◀️ رجوع", b"section_tools")]]
+
+
 def account_section_keyboard():
     return [
         [Button.inline("📊 الاحصائيات", b"stats_menu"), Button.inline("📂 بياناتي", b"my_data_menu")],
         [Button.inline("💬 قروباتي وقنواتي", b"stats_menu"), Button.inline("🎭 الانتحال", b"clone_menu")],
-        [Button.inline("🚶 المغادرة والتصفية", b"leave_cleanup_menu"), Button.inline("🔗 رابط الحساب", b"account_link_info")],
-        [Button.inline("📆 تاريخ الإنشاء", b"creation_info"), Button.inline("💳 الأيدي", b"id_menu")],
+        [Button.inline("🚶 المغادرة والتصفية", b"leave_cleanup_menu"), Button.inline("📆 تاريخ الإنشاء", b"creation_info")],
+        [Button.inline("💳 الأيدي", b"id_menu")],
         [Button.inline("◀️ رجوع", b"source_features_menu")]
     ]
 
@@ -2911,8 +2915,8 @@ def download_section_keyboard():
 
 def tools_section_keyboard():
     return [
-        [Button.inline("📟 الآلة الحاسبة", b"calculator_menu"), Button.inline("✍️ الكتابة والخطوط", b"writing_menu")],
-        [Button.inline("🖼 الصيغ والتحويل", b"conversion_menu")],
+        [Button.inline("🔗 رابط الحساب", b"account_link_info"), Button.inline("✍️ الكتابة والخطوط", b"writing_menu")],
+        [Button.inline("📟 الآلة الحاسبة", b"calculator_menu"), Button.inline("🖼 الصيغ والتحويل", b"conversion_menu")],
         [Button.inline("◀️ رجوع", b"source_features_menu")]
     ]
 
@@ -3534,7 +3538,7 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(ACCOUNT_LINK_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(ACCOUNT_LINK_GUIDE, buttons=tools_back_keyboard())
 
     elif data == b"creation_info":
         if not is_source_subscribed(user_id):
@@ -3564,7 +3568,7 @@ async def callback_handler(event):
             b"section_self_save": ("🧧 **قسم حفظ الذاتية**\n\nاختر ما تريد من الأسفل.", self_save_section_keyboard()),
             b"section_publish": ("📍 **قسم النشر التلقائي**\n\nاختر ما تريد من الأسفل.", publish_section_keyboard()),
             b"section_download": ("🎧 **قسم البحث والتحميل**\n\nاختر ما تريد من الأسفل.", download_section_keyboard()),
-            b"section_tools": ("💾 **قسم صندوق الأدوات**\n\nاختر ما تريد من الأسفل.", tools_section_keyboard())
+            b"section_tools": ("🧰 **قسم الأدوات**\n\nاختر ما تريد من الأسفل.", tools_section_keyboard())
         }
         title, buttons = section_map[data]
         await event.edit(title, buttons=buttons)
@@ -3585,7 +3589,8 @@ async def callback_handler(event):
             b"broadcast_menu": BROADCAST_GUIDE,
             b"leave_cleanup_menu": LEAVE_CLEANUP_GUIDE
         }
-        await event.edit(guide_map[data], buttons=section_back_keyboard())
+        buttons = tools_back_keyboard() if data == b"writing_menu" else section_back_keyboard()
+        await event.edit(guide_map[data], buttons=buttons)
 
     elif data == b"calculator_menu":
         if not is_source_subscribed(user_id):
