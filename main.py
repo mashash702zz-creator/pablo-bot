@@ -74,6 +74,7 @@ SPEED_MAP = {
 activation_codes = {}
 source_activation_codes = {}
 activation_log = []
+admin_error_log = []
 users_db = {}
 user_clients = {}
 user_states = {}
@@ -105,6 +106,7 @@ def save_data():
             "activation_codes": activation_codes,
             "source_activation_codes": source_activation_codes,
             "activation_log": activation_log[-500:],
+            "admin_error_log": admin_error_log[-200:],
             "admin_ids": ADMIN_IDS
         }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -113,7 +115,7 @@ def save_data():
         print(f"Error saving data: {e}")
 
 def load_data():
-    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, activation_log, ADMIN_IDS
+    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, activation_log, admin_error_log, ADMIN_IDS
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -126,6 +128,7 @@ def load_data():
                 activation_codes = data.get("activation_codes", {})
                 source_activation_codes = data.get("source_activation_codes", {})
                 activation_log = data.get("activation_log", [])
+                admin_error_log = data.get("admin_error_log", [])
                 loaded_admins = data.get("admin_ids", None)
                 if loaded_admins:
                     ADMIN_IDS = [int(a) for a in loaded_admins]
@@ -169,6 +172,69 @@ def _subscription_state(user_id):
     info = users_db.get(user_id, {})
     now = time.time()
     return now < info.get("expires_at", 0), now < info.get("source_expires_at", 0)
+
+
+# ==================== Admin Backup, Sessions & Error Log ====================
+def _backup_file_path(prefix="backup"):
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(TEMP_DIR, f"{prefix}_{stamp}.json")
+
+
+def create_settings_backup():
+    """ينشئ نسخة من الإعدادات والاشتراكات والأكواد فقط، دون ملفات جلسات حساسة."""
+    save_data()
+    output = _backup_file_path("pablo_backup")
+    shutil.copy2(DATA_FILE, output)
+    return output
+
+
+async def disconnect_user_session_only(user_id, reason="فصل من لوحة الأدمن"):
+    """يفصل جلسة الحساب ومهامه دون حذف اشتراك المستخدم أو بياناته."""
+    stop_running_task(user_id)
+    client = user_clients.pop(user_id, None)
+    await stop_auto_publish_task(client, user_id, reason=reason)
+    for key, task in list(broadcast_tasks.items()):
+        if key == user_id and task and not task.done():
+            task.cancel()
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        _safe_remove(f"{SESSIONS_DIR}/user_{user_id}{suffix}")
+    _append_activation_log("فصل_جلسة", user_id, note=reason)
+    save_data()
+
+
+def list_saved_session_ids():
+    ids = set()
+    for item in Path(SESSIONS_DIR).glob("user_*.session"):
+        match = re.fullmatch(r"user_(\d+)\.session", item.name)
+        if match:
+            ids.add(int(match.group(1)))
+    return sorted(ids)
+
+
+async def report_admin_error(operation, error, user_id=None, chat_id=None):
+    """يسجل خطأً منظماً ويبلغ المسؤولين الذين بدأوا البوت."""
+    entry = {
+        "time": int(time.time()),
+        "operation": str(operation),
+        "error": str(error)[:1200],
+        "user_id": int(user_id) if user_id is not None else None,
+        "chat_id": str(chat_id) if chat_id is not None else None,
+    }
+    admin_error_log.append(entry)
+    del admin_error_log[:-200]
+    save_data()
+    details = f"⚠️ **سجل خطأ جديد**\n\n• العملية: `{entry['operation']}`\n• المستخدم: `{entry['user_id'] or 'غير محدد'}`\n• المحادثة: `{entry['chat_id'] or 'غير محددة'}`\n• السبب: `{entry['error']}`"
+    for admin_id in list(ADMIN_IDS):
+        try:
+            await bot.send_message(admin_id, details)
+        except Exception:
+            pass
+
 
 
 async def remove_user_completely(user_id, reason="حذف"):
@@ -795,6 +861,28 @@ async def _send_publish_stop_notice(owner_id, target_name, reason):
         pass
 
 
+async def check_publish_permission(client, target_chat_id, owner_id=None):
+    """يفحص حق الإرسال قبل إنشاء مهمة النشر، دون إرسال رسالة اختبار للوجهة."""
+    try:
+        entity = await client.get_entity(target_chat_id)
+        name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(target_chat_id)
+        if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+            perms = await client.get_permissions(entity, "me")
+            if getattr(perms, "is_banned", False) or getattr(perms, "send_messages", None) is False:
+                return False, name, "لا تستطيع النشر في هذه القناة؛ أنت محظور أو لا تملك صلاحية الإرسال."
+            if not (getattr(perms, "is_admin", False) or getattr(perms, "is_creator", False)):
+                return False, name, "لا تستطيع النشر في هذه القناة؛ يجب أن تكون مالكاً أو أدمن بصلاحية النشر."
+        else:
+            perms = await client.get_permissions(entity, "me")
+            if getattr(perms, "is_banned", False) or getattr(perms, "send_messages", None) is False:
+                return False, name, "لا تستطيع الإرسال في هذه المجموعة؛ ربما تم تقييدك أو حظرك."
+        return True, name, ""
+    except Exception as e:
+        if owner_id is not None:
+            await report_admin_error("فحص صلاحيات النشر", e, owner_id, target_chat_id)
+        return False, str(target_chat_id), f"تعذر فحص صلاحية الإرسال: {e}"
+
+
 async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False):
     task_key = (owner_id, int(target_chat_id))
     old_task = auto_publish_tasks.get(task_key)
@@ -815,6 +903,7 @@ async def start_auto_publish_task(client, owner_id, target_chat_id, source_messa
             await _send_publish_stop_notice(owner_id, target_name, reason)
             raise
         except Exception as e:
+            await report_admin_error("توقف النشر التلقائي", e, owner_id, target_chat_id)
             await _send_publish_stop_notice(owner_id, target_name, str(e))
         finally:
             auto_publish_tasks.pop(task_key, None)
@@ -1881,6 +1970,10 @@ async def register_userbot_events(client_inst, owner_id):
                         target_chat_id = int(clean_parts[3])
                     if delay < 0.5 or count < 1:
                         raise ValueError("أقل مدة مسموحة 0.5 ثانية والعدد يجب أن يكون أكبر من صفر.")
+                    allowed, target_name, permission_reason = await check_publish_permission(client_inst, target_chat_id, owner_id)
+                    if not allowed:
+                        await client_inst.send_message(chat_id, f"❌ لم يبدأ النشر في {target_name}.\n• السبب ← {permission_reason}")
+                        return
                     if count == 999:
                         count = 10**9
                     reply_message = await event.get_reply_message()
@@ -2136,6 +2229,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await download_and_send_url(client_inst, chat_id, url, audio_only=False)
                     await status.delete()
                 except Exception as e:
+                    await report_admin_error("تحميل رابط", e, owner_id, chat_id)
                     await status.edit(f"❌ تعذر التحميل:\n`{e}`")
                 return
 
@@ -2149,6 +2243,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await download_and_send_url(client_inst, chat_id, url)
                     await status.delete()
                 except Exception as e:
+                    await report_admin_error("تحميل بنترست", e, owner_id, chat_id)
                     await status.edit(f"❌ تعذر تحميل بنترست:\n`{e}`")
                 return
 
@@ -2162,6 +2257,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await download_telegram_story(client_inst, chat_id, url)
                     await status.delete()
                 except Exception as e:
+                    await report_admin_error("تحميل ستوري", e, owner_id, chat_id)
                     await status.edit(f"❌ تعذر تحميل الستوري:\n`{e}`")
                 return
 
@@ -2175,6 +2271,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await download_github_repository(client_inst, chat_id, url)
                     await status.delete()
                 except Exception as e:
+                    await report_admin_error("تحميل مستودع", e, owner_id, chat_id)
                     await status.edit(f"❌ تعذر تحميل المستودع:\n`{e}`")
                 return
 
@@ -2973,6 +3070,8 @@ def admin_menu_keyboard():
         [Button.inline("➕ تفعيل البوت لمستخدم بالايدي", b"manual_activate_start")],
         [Button.inline("📅 تمديد اشتراك مستخدم", b"extend_subscription_start")],
         [Button.inline("📋 سجل التفعيل", b"activation_log_menu"), Button.inline("⌛ المنتهية اليوم", b"expired_today_menu")],
+        [Button.inline("💾 إنشاء نسخة احتياطية", b"backup_export"), Button.inline("📥 استيراد نسخة احتياطية", b"backup_import_start")],
+        [Button.inline("📱 إدارة جلسات الحسابات", b"sessions_menu"), Button.inline("⚠️ سجل الأخطاء", b"admin_error_log_menu")],
         [Button.inline("📢 إذاعة عامة", b"broadcast_start")],
         [Button.inline("📝 إدارة التسطير الأساسي", b"admin_tastir_menu"), Button.inline("🎯 إدارة الفرديات الأساسية", b"admin_fardiyyat_menu")],
         [Button.inline("👥 قائمة المسؤولين", b"list_admins"), Button.inline("📋 قائمة المستخدمين", b"list_users")],
@@ -4348,6 +4447,48 @@ async def callback_handler(event):
         user_states[user_id] = {"step": "awaiting_delete_admin_id"}
         await event.edit("❌ **حذف مسؤول:**\n\nأرسل المعرف الرقمي (ID) للمسؤول المراد إزالته:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
+    elif data == b"backup_export" and user_id in ADMIN_IDS:
+        try:
+            backup_path = create_settings_backup()
+            await bot.send_file(user_id, backup_path, caption="💾 نسخة احتياطية للإعدادات والاشتراكات والأكواد. لا تتضمن ملفات الجلسات الحساسة.")
+        except Exception as e:
+            await report_admin_error("إنشاء نسخة احتياطية", e, user_id)
+            await event.answer("❌ تعذر إنشاء النسخة الاحتياطية.", alert=True)
+
+    elif data == b"backup_import_start" and user_id in ADMIN_IDS:
+        user_states[user_id] = {"step": "awaiting_backup_import"}
+        await event.edit("📥 أرسل الآن ملف النسخة الاحتياطية بصيغة JSON. سيتم حفظ نسخة تلقائية من البيانات الحالية قبل الاستيراد.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+
+    elif data == b"sessions_menu" and user_id in ADMIN_IDS:
+        saved_ids = list_saved_session_ids()
+        connected_ids = sorted(user_clients.keys())
+        saved_text = "\n".join(f"• `{uid}`" for uid in saved_ids[:40]) or "لا توجد جلسات محفوظة."
+        connected_text = "\n".join(f"• `{uid}`" for uid in connected_ids[:40]) or "لا توجد جلسات متصلة حالياً."
+        await event.edit(
+            f"📱 **إدارة جلسات الحسابات**\n\n🗃️ جلسات محفوظة:\n{saved_text}\n\n🟢 جلسات متصلة الآن:\n{connected_text}",
+            buttons=[[Button.inline("❌ فصل جلسة مستخدم", b"session_disconnect_start")], [Button.inline("🔙 رجوع", b"admin_menu")]]
+        )
+
+    elif data == b"session_disconnect_start" and user_id in ADMIN_IDS:
+        user_states[user_id] = {"step": "awaiting_disconnect_session_id"}
+        await event.edit("❌ أرسل آيدي المستخدم الذي تريد فصل جلسته. لن يتم حذف اشتراكه أو بياناته، لكنه يحتاج لتسجيل الدخول من جديد.", buttons=[[Button.inline("🔙 رجوع", b"sessions_menu")]])
+
+    elif data == b"admin_error_log_menu" and user_id in ADMIN_IDS:
+        if not admin_error_log:
+            await event.edit("✅ لا يوجد أخطاء مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        else:
+            rows = []
+            for item in admin_error_log[-15:][::-1]:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("time", 0)))
+                rows.append(f"• `{when}` | {item.get('operation')} | مستخدم: `{item.get('user_id') or '- '}`\n  السبب: `{item.get('error')}`")
+            await event.edit("⚠️ **آخر أخطاء النظام:**\n\n" + "\n\n".join(rows), buttons=[[Button.inline("🗑️ مسح سجل الأخطاء", b"admin_error_log_clear")], [Button.inline("🔙 رجوع", b"admin_menu")]])
+
+    elif data == b"admin_error_log_clear" and user_id in ADMIN_IDS:
+        admin_error_log.clear()
+        save_data()
+        await event.answer("✅ تم مسح سجل الأخطاء.", alert=True)
+        await event.edit("✅ لا يوجد أخطاء مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+
     elif data == b"admin_stats" and user_id in ADMIN_IDS:
         txt = f"📊 **إحصائيات النظام:**\n\n• إجمالي المسجلين: {len(users_db)}\n• عدد المسؤولين: {len(ADMIN_IDS)}\n• الحسابات المتصلة حالياً: {len(user_clients)}\n• المهام الشغالة حالياً: {len(running_tasks)}"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
@@ -4389,7 +4530,50 @@ async def message_input_handler(event):
     step = state.get("step")
     text = event.raw_text.strip() if event.raw_text else ""
 
-    if step == "awaiting_clone_target":
+    if step == "awaiting_backup_import":
+        if user_id not in ADMIN_IDS:
+            user_states.pop(user_id, None)
+            return
+        if not event.document:
+            await event.respond("⚠️ أرسل ملف JSON للنسخة الاحتياطية.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+            return
+        imported_path = None
+        try:
+            imported_path = await event.download_media(file=TEMP_DIR)
+            with open(imported_path, "r", encoding="utf-8") as handle:
+                imported = json.load(handle)
+            if not isinstance(imported, dict) or "users_db" not in imported:
+                raise ValueError("ملف النسخة الاحتياطية غير صالح.")
+            current_backup = create_settings_backup()
+            with open(DATA_FILE, "w", encoding="utf-8") as handle:
+                json.dump(imported, handle, ensure_ascii=False, indent=4)
+            for session_client in list(user_clients.values()):
+                try:
+                    await session_client.disconnect()
+                except Exception:
+                    pass
+            user_clients.clear()
+            load_data()
+            user_states.pop(user_id, None)
+            await event.respond(f"✅ تم استيراد النسخة الاحتياطية بنجاح. تم حفظ نسخة من البيانات السابقة في: `{os.path.basename(current_backup)}`", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        except Exception as e:
+            await report_admin_error("استيراد نسخة احتياطية", e, user_id)
+            await event.respond(f"❌ تعذر استيراد النسخة: `{e}`", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        finally:
+            _safe_remove(imported_path)
+        return
+
+    elif step == "awaiting_disconnect_session_id":
+        if user_id not in ADMIN_IDS or not text.isdigit():
+            await event.respond("⚠️ أرسل آيدي رقمي صحيح.", buttons=[[Button.inline("🔙 رجوع", b"sessions_menu")]])
+            return
+        target_id = int(text)
+        await disconnect_user_session_only(target_id)
+        user_states.pop(user_id, None)
+        await event.respond(f"✅ تم فصل جلسة المستخدم `{target_id}` وإيقاف مهامه، مع بقاء اشتراكه وبياناته.", buttons=[[Button.inline("🔙 رجوع", b"sessions_menu")]])
+        return
+
+    elif step == "awaiting_clone_target":
         client = user_clients.get(user_id)
         if not client:
             user_states.pop(user_id, None)
@@ -4674,6 +4858,7 @@ async def message_input_handler(event):
             )
         except Exception as e:
             user_states.pop(user_id, None)
+            await report_admin_error("إرسال كود تسجيل الدخول", e, user_id)
             await msg.edit(f"❌ حدث خطأ أثناء إرسال الكود:\n`{e}`\n\nتأكد من كتابة الرقم بشكل صحيح مع رمز الدولة ثم حاول مجدداً.")
 
     elif step == "awaiting_code":
@@ -4696,6 +4881,7 @@ async def message_input_handler(event):
             }
             await msg.edit("🔐 **الحساب محمي بالتحقق بخطوتين (2FA):**\n\nيرجى إرسال كلمة المرور (الباسورد) الخاصة بحسابك الآن:")
         except Exception as e:
+            await report_admin_error("تأكيد كود تسجيل الدخول", e, user_id)
             await msg.edit(f"❌ رمز التحقق غير صحيح أو منتهي الصلاحية:\n`{e}`\n\nأعد إرسال الكود الصحيح:")
 
     elif step == "awaiting_password":
@@ -4709,6 +4895,7 @@ async def message_input_handler(event):
             user_states.pop(user_id, None)
             await msg.edit("✅ **تم تسجيل الدخول وربط حسابك بنجاح!**\nيمكنك الآن استخدام أوامر البوت مباشرة في القروبات والمحادثات.")
         except Exception as e:
+            await report_admin_error("تأكيد كلمة مرور تسجيل الدخول", e, user_id)
             await msg.edit(f"❌ كلمة المرور غير صحيحة:\n`{e}`\n\nيرجى إرسال كلمة المرور الصحيحة مرة أخرى:")
 
     elif step == "awaiting_voice":
