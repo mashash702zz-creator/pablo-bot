@@ -1048,22 +1048,37 @@ SOURCE_MENU_FALLBACK = """⚠️ تعذر إرسال قائمة الأزرار �
 فعّل Inline Mode لبوت بابلو من @BotFather عبر الأمر `/setinline`، ثم أعد تشغيل البوت وجرب `.الاوامر` مرة أخرى."""
 
 
+# رموز مؤقتة تمنع أي شخص غير صاحب الجلسة من استدعاء قائمة السورس المضمّنة.
+inline_source_requests = {}
+
+
 async def send_source_commands_menu(client, owner_id, chat_id):
-    """يرسل قائمة مضمّنة من بوت بابلو داخل نفس المحادثة (عبر @اسم_البوت)."""
+    """يرسل القائمة فقط من جلسة الحساب المرتبط وبنفس المحادثة."""
     try:
+        me = await client.get_me()
+        if me.id != owner_id:
+            raise RuntimeError("جلسة اليوزر بوت لا تطابق صاحب الحساب المرتبط")
         bot_me = await bot.get_me()
         if not bot_me.bot:
-            raise RuntimeError("جلسة الإدارة ليست جلسة بوت. أعد التشغيل بهذه النسخة لإنشاء جلسة البوت المستقلة")
+            raise RuntimeError("جلسة الإدارة ليست جلسة بوت")
         if not bot_me.username:
             raise RuntimeError("لا يوجد يوزر لبوت الإدارة")
-        results = await client.inline_query(bot_me.username, "pablo_source_menu")
+        token = secrets.token_urlsafe(18)
+        inline_source_requests[token] = {"owner_id": owner_id, "expires_at": time.time() + 90}
+        results = await client.inline_query(bot_me.username, f"pablo_source_menu:{token}")
         if not results:
+            inline_source_requests.pop(token, None)
             raise RuntimeError("لم تصل نتيجة القائمة المضمّنة؛ فعّل Inline Mode للبوت من BotFather")
         await results[0].click(chat_id)
         return True
     except Exception as e:
-        print(f"\n[INLINE MENU ERROR] {type(e).__name__}: {e}\nفعّل Inline Mode من BotFather عبر /setinline ثم أعد تشغيل البوت.\n")
-        await client.send_message(chat_id, SOURCE_MENU_FALLBACK)
+        bot_name = getattr(bot_me, "username", "بوت الإدارة") if "bot_me" in locals() else "بوت الإدارة"
+        reason = f"{type(e).__name__}: {e}"
+        print(f"\n[INLINE MENU ERROR] {reason}\n")
+        await client.send_message(
+            chat_id,
+            f"⚠️ تعذر إظهار قائمة الأزرار عبر @{bot_name}.\n• السبب ← `{reason}`\n\nفعّل Inline Mode لهذا البوت من @BotFather عبر `/setinline` ثم أعد تشغيل البوت."
+        )
         return False
 
 
@@ -1811,7 +1826,7 @@ async def register_userbot_events(client_inst, owner_id):
                     save_data()
                 return
 
-            # أوامر السورس فقط يجب أن تبدأ بالنقطة.
+            # أوامر السورس، ومن ضمنها .الاوامر، لا تعمل إلا بالنقطة.
             if not text.startswith("."):
                 return
             text = legacy_text
@@ -4502,7 +4517,13 @@ async def callback_handler(event):
 @bot.on(events.InlineQuery)
 async def inline_source_menu_handler(event):
     query = (event.text or "").strip()
-    if query == "pablo_source_menu":
+    if query.startswith("pablo_source_menu:"):
+        token = query.split(":", 1)[1]
+        request = inline_source_requests.pop(token, None)
+        # لا نعيد أي نتيجة إذا لم تأتِ من الحساب المرتبط الذي طلب القائمة للتو.
+        if not request or request.get("expires_at", 0) < time.time() or request.get("owner_id") != event.sender_id:
+            await event.answer([], cache_time=0, is_personal=True)
+            return
         result = event.builder.article(
             title="مميزات السورس — بوت بابلو",
             text=SOURCE_MENU_TITLE,
