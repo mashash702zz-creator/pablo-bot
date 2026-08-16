@@ -4,6 +4,7 @@ import random
 import secrets
 import time
 import json
+import math
 import re
 import shutil
 import zipfile
@@ -18,13 +19,19 @@ except ImportError:
     Image = None
 from telethon import TelegramClient, events, Button
 from telethon.errors import SessionPasswordNeededError, MessageNotModifiedError
-from telethon.tl.functions.channels import EditBannedRequest, CreateChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.functions.channels import EditBannedRequest, CreateChannelRequest, LeaveChannelRequest, JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest, GetBotCallbackAnswerRequest
+from telethon.tl.functions.account import (
+    UpdateProfileRequest, UpdateEmojiStatusRequest, UpdateColorRequest,
+    UpdateBirthdayRequest, UpdateBusinessLocationRequest, UpdateBusinessWorkHoursRequest
+)
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
 from telethon.tl.types import (
     ChatBannedRights, ChannelParticipantCreator, ChannelParticipantAdmin,
-    DocumentAttributeSticker, InputStickerSetEmpty
+    DocumentAttributeSticker, InputStickerSetEmpty, EmojiStatus, EmojiStatusEmpty,
+    EmojiStatusCollectible, PeerColor, Birthday, BusinessLocation, BusinessWorkHours,
+    BusinessWeeklyOpen, InputGeoPoint
 )
 
 # ==================== Configuration ====================
@@ -42,18 +49,17 @@ ADMIN_IDS = [520859814]
 DEV_URL = "https://t.me/Nardouv"
 CHANNEL_URL = "https://t.me/PabloBot666"
 
-# ملف حفظ البيانات ومجلد الصوتيات والجلسات
-DATA_FILE = "bot_data.json"
-VOICES_DIR = "voices"
-SESSIONS_DIR = "sessions"
-TEMP_DIR = "temp_media"
+# ملفات البيانات والجلسات. عيّن PERSISTENT_DATA_DIR لمسار القرص الدائم في السيرفر.
+# إذا لم يضبط المتغير، تعمل الملفات محلياً في مجلد المشروع كالمعتاد.
+PERSISTENT_DIR = os.path.abspath(os.getenv("PERSISTENT_DATA_DIR", "."))
+os.makedirs(PERSISTENT_DIR, exist_ok=True)
+DATA_FILE = os.path.join(PERSISTENT_DIR, "bot_data.json")
+VOICES_DIR = os.path.join(PERSISTENT_DIR, "voices")
+SESSIONS_DIR = os.path.join(PERSISTENT_DIR, "sessions")
+TEMP_DIR = os.path.join(PERSISTENT_DIR, "temp_media")
 
-if not os.path.exists(VOICES_DIR):
-    os.makedirs(VOICES_DIR)
-if not os.path.exists(SESSIONS_DIR):
-    os.makedirs(SESSIONS_DIR)
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+for _directory in (VOICES_DIR, SESSIONS_DIR, TEMP_DIR):
+    os.makedirs(_directory, exist_ok=True)
 
 # خريطة السرعة بالثواني
 SPEED_MAP = {
@@ -73,8 +79,10 @@ SPEED_MAP = {
 # قواعد البيانات في الذاكرة والتخزين المؤقت للبحث
 activation_codes = {}
 source_activation_codes = {}
+all_activation_codes = {}
 activation_log = []
 admin_error_log = []
+expired_code_history = []
 users_db = {}
 user_clients = {}
 user_states = {}
@@ -88,34 +96,82 @@ default_reply = []
 # المهام النشطة
 running_tasks = {}
 auto_publish_tasks = {}
+auto_publish_meta = {}
 broadcast_tasks = {}
 calculator_sessions = {}
 publish_stop_reasons = {}
+manual_flush_tasks = {}
+# مهام التفليش التي تبدأ من زر البوت؛ تستخدم لإيقاف العملية من الزر نفسه.
+bot_flush_tasks = {}
+storage_notice_cache = {}
+# آخر مصدر أرسل بطاقة تنبيه لكل حساب؛ تتغير البطاقة فقط عند الانتقال لمصدر مختلف.
+storage_active_sources = {}
+# تخزين مؤقت خفيف لتقليل طلبات الشبكة والقرص المتكررة، من دون تغيير الميزات.
+_user_me_cache = {}
+_translation_cache = {}
+_pending_save_handle = None
 
 # جلسة مستقلة للبوت؛ تمنع استخدام جلسة حساب شخصي قديمة بدل بوت الإدارة.
 bot = TelegramClient("manager_bot_8617294862", API_ID, API_HASH)
 
 # ==================== Persistence Functions ====================
-def save_data():
+def _build_data_snapshot():
+    return {
+        "default_tastir": default_tastir,
+        "default_fardiyyat": default_fardiyyat,
+        "default_reply": default_reply,
+        "users_db": users_db,
+        "activation_codes": activation_codes,
+        "source_activation_codes": source_activation_codes,
+        "all_activation_codes": all_activation_codes,
+        "activation_log": activation_log[-500:],
+        "admin_error_log": admin_error_log[-200:],
+        "expired_code_history": expired_code_history[-500:],
+        "admin_ids": ADMIN_IDS
+    }
+
+
+def _write_data_snapshot():
+    """كتابة ذرية سريعة: لا توقف الأمر عند تعدد تعديلات صغيرة متقاربة."""
     try:
-        data = {
-            "default_tastir": default_tastir,
-            "default_fardiyyat": default_fardiyyat,
-            "default_reply": default_reply,
-            "users_db": users_db,
-            "activation_codes": activation_codes,
-            "source_activation_codes": source_activation_codes,
-            "activation_log": activation_log[-500:],
-            "admin_error_log": admin_error_log[-200:],
-            "admin_ids": ADMIN_IDS
-        }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        os.makedirs(os.path.dirname(DATA_FILE) or ".", exist_ok=True)
+        temp_path = DATA_FILE + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(_build_data_snapshot(), f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temp_path, DATA_FILE)
     except Exception as e:
         print(f"Error saving data: {e}")
 
+
+def _flush_scheduled_save():
+    global _pending_save_handle
+    _pending_save_handle = None
+    _write_data_snapshot()
+
+
+def save_data(force=False):
+    """يجمع عمليات الحفظ المتقاربة لمدة قصيرة كي لا تعطل استجابة الأوامر."""
+    global _pending_save_handle
+    if force:
+        if _pending_save_handle:
+            try:
+                _pending_save_handle.cancel()
+            except Exception:
+                pass
+            _pending_save_handle = None
+        _write_data_snapshot()
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write_data_snapshot()
+        return
+    if _pending_save_handle and not _pending_save_handle.cancelled():
+        return
+    _pending_save_handle = loop.call_later(0.20, _flush_scheduled_save)
+
 def load_data():
-    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, activation_log, admin_error_log, ADMIN_IDS
+    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, all_activation_codes, activation_log, admin_error_log, expired_code_history, ADMIN_IDS
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -127,8 +183,10 @@ def load_data():
                 users_db = {int(k): v for k, v in raw_users.items()}
                 activation_codes = data.get("activation_codes", {})
                 source_activation_codes = data.get("source_activation_codes", {})
+                all_activation_codes = data.get("all_activation_codes", {})
                 activation_log = data.get("activation_log", [])
                 admin_error_log = data.get("admin_error_log", [])
+                expired_code_history = data.get("expired_code_history", [])
                 loaded_admins = data.get("admin_ids", None)
                 if loaded_admins:
                     ADMIN_IDS = [int(a) for a in loaded_admins]
@@ -168,6 +226,39 @@ def _append_activation_log(action, user_id, admin_id=None, days=0, tastir=False,
     del activation_log[:-500]
 
 
+def _pop_activation_code_details(code_store, code):
+    """يدعم الأكواد القديمة التي قيمتها عدد أيام، والجديدة التي تحفظ منشئ الكود."""
+    if code not in code_store:
+        return None
+    raw = code_store.pop(code)
+    if isinstance(raw, dict):
+        return int(raw.get("days", 0)), raw.get("created_by")
+    return int(raw), None
+
+
+async def _issuer_details_text(admin_id):
+    if not admin_id:
+        return "غير مسجل (كود قديم)"
+    try:
+        return await format_user_details(int(admin_id))
+    except Exception:
+        return f"• الاسم: مسؤول\n• الآيدي: `{admin_id}`\n• اليوزر: ماعنده"
+
+
+async def apply_any_activation_code(user_id, code, event):
+    """يحاول التسطير ثم السورس ثم جميع الصلاحيات ويعيد نوع الاشتراك."""
+    success, days = await apply_activation_code(user_id, code, event)
+    if success:
+        return "tastir", days
+    success, days = await apply_source_activation_code(user_id, code, event)
+    if success:
+        return "source", days
+    success, days = await apply_full_activation_code(user_id, code, event)
+    if success:
+        return "all", days
+    return None, 0
+
+
 def _subscription_state(user_id):
     info = users_db.get(user_id, {})
     now = time.time()
@@ -182,7 +273,7 @@ def _backup_file_path(prefix="backup"):
 
 def create_settings_backup():
     """ينشئ نسخة من الإعدادات والاشتراكات والأكواد فقط، دون ملفات جلسات حساسة."""
-    save_data()
+    save_data(force=True)
     output = _backup_file_path("demon_backup")
     shutil.copy2(DATA_FILE, output)
     return output
@@ -217,24 +308,69 @@ def list_saved_session_ids():
 
 
 async def report_admin_error(operation, error, user_id=None, chat_id=None):
-    """يسجل خطأً منظماً ويبلغ المسؤولين الذين بدأوا البوت."""
+    """يسجل ويرسل للأدمن أخطاء الدخول أو الأكواد فقط، مع بيانات المستخدم كاملة."""
+    operation_text = str(operation)
+    allowed_words = ("تسجيل الدخول", "تفعيل", "كود", "رمز")
+    if not any(word in operation_text for word in allowed_words):
+        print(f"[غير مسجل للأدمن] {operation_text}: {error}")
+        return
     entry = {
         "time": int(time.time()),
-        "operation": str(operation),
+        "operation": operation_text,
         "error": str(error)[:1200],
         "user_id": int(user_id) if user_id is not None else None,
         "chat_id": str(chat_id) if chat_id is not None else None,
     }
     admin_error_log.append(entry)
     del admin_error_log[:-200]
+    name = "غير محدد"
+    username = "ماعنده"
+    if user_id is not None:
+        try:
+            entity = await bot.get_entity(user_id)
+            name = f"{getattr(entity, 'first_name', '') or ''} {getattr(entity, 'last_name', '') or ''}".strip() or "بدون اسم"
+            username = f"@{entity.username}" if getattr(entity, "username", None) else "ماعنده"
+        except Exception:
+            stored = users_db.get(int(user_id), {})
+            name = stored.get("display_name", name)
+            username = stored.get("display_username", username)
+    entry["name"] = name
+    entry["username"] = username
     save_data()
-    details = f"⚠️ **سجل خطأ جديد**\n\n• العملية: `{entry['operation']}`\n• المستخدم: `{entry['user_id'] or 'غير محدد'}`\n• المحادثة: `{entry['chat_id'] or 'غير محددة'}`\n• السبب: `{entry['error']}`"
+    details = (
+        "⚠️ **سجل دخول أو تفعيل**\n\n"
+        f"• العملية: `{entry['operation']}`\n"
+        f"• الاسم: {name}\n"
+        f"• الآيدي: `{entry['user_id'] or 'غير محدد'}`\n"
+        f"• اليوزر: {username}\n"
+        f"• السبب: `{entry['error']}`"
+    )
     for admin_id in list(ADMIN_IDS):
         try:
             await bot.send_message(admin_id, details)
         except Exception:
             pass
 
+
+
+def _remember_user_identity(user_id, sender):
+    if user_id not in users_db:
+        return
+    users_db[user_id]["display_name"] = f"{getattr(sender, 'first_name', '') or ''} {getattr(sender, 'last_name', '') or ''}".strip() or "مستخدم"
+    users_db[user_id]["display_username"] = f"@{sender.username}" if getattr(sender, "username", None) else "ماعنده"
+
+
+def _remember_expired_code_user(user_id, info, subscription_type="جميع الاشتراكات"):
+    expired_code_history.append({
+        "time": int(time.time()),
+        "user_id": int(user_id),
+        "name": info.get("display_name", "مستخدم"),
+        "username": info.get("display_username", "ماعنده"),
+        "subscription_type": subscription_type,
+        "tastir_expired_at": int(info.get("expires_at", 0)),
+        "source_expired_at": int(info.get("source_expires_at", 0)),
+    })
+    del expired_code_history[:-500]
 
 
 async def remove_user_completely(user_id, reason="حذف"):
@@ -254,6 +390,9 @@ async def remove_user_completely(user_id, reason="حذف"):
             pass
     for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
         _safe_remove(f"{SESSIONS_DIR}/user_{user_id}{suffix}")
+    old_info = users_db.get(user_id, {})
+    if "انتهاء" in reason and not old_info.get("expired_code_logged"):
+        _remember_expired_code_user(user_id, old_info)
     users_db.pop(user_id, None)
     user_states.pop(user_id, None)
     _append_activation_log("حذف_مستخدم", user_id, note=reason)
@@ -279,6 +418,13 @@ async def subscription_maintenance_loop():
                     except Exception:
                         pass
                     notices[kind] = True
+                    changed = True
+            # يسجل كل كود منتهٍ مرة واحدة حتى لو بقي الاشتراك الآخر فعالاً.
+            expired_logged = info.setdefault("expired_code_logged", {})
+            for key, exp, label in (("tastir", t_exp, "التسطير"), ("source", s_exp, "مميزات السورس")):
+                if exp > 0 and now >= exp and not expired_logged.get(key):
+                    _remember_expired_code_user(uid, info, label)
+                    expired_logged[key] = True
                     changed = True
             if now >= t_exp and now >= s_exp:
                 try:
@@ -350,7 +496,6 @@ def init_user_db(user_id):
     u.setdefault("del_voice_cmd", True)
     u.setdefault("muted_users", [])
     u.setdefault("speed", 1.0)
-    u.setdefault("flush_speed", 0.5)
     u.setdefault("storage_groups", [])
     u.setdefault("welcome_enabled", False)
     u.setdefault("welcome_text", "أهلاً بك، نورت الخاص.")
@@ -362,6 +507,8 @@ def init_user_db(user_id):
     u.setdefault("username_history", [])
     u.setdefault("self_save_enabled", False)
     u.setdefault("self_save_chat_id", None)
+    # اشتراكات القنوات/القروبات المطلوبة قبل النشر، ومهام النشر التي تستأنف بعد إعادة التشغيل.
+    u.setdefault("auto_publish_jobs", [])
     save_data()
 
 def get_next_voice_number(user_id):
@@ -389,82 +536,119 @@ def check_cmd_exists(user_id, cmd):
     return cmd in all_start_cmds
 
 async def format_user_details(user_id):
+    stored = users_db.get(int(user_id), {})
     try:
         entity = await bot.get_entity(user_id)
         first_name = entity.first_name or "بدون اسم"
         last_name = f" {entity.last_name}" if entity.last_name else ""
         full_name = f"{first_name}{last_name}".strip()
-        username = f"@{entity.username}" if entity.username else "لا يوجد اسم مستخدم"
+        username = f"@{entity.username}" if entity.username else "ماعنده"
     except Exception:
-        full_name = "مستخدم"
-        username = "لا يوجد اسم مستخدم"
+        full_name = stored.get("display_name", "مستخدم")
+        username = stored.get("display_username", "ماعنده")
 
     profile_link = f"[{full_name}](tg://openmessage?user_id={user_id})"
-    return f"• الاسم: {profile_link}\n  • المعرف: `{user_id}`\n  • اسم المستخدم: {username}"
+    return f"• الاسم: {profile_link}\n• الآيدي: `{user_id}`\n• اليوزر: {username}"
 
 async def apply_activation_code(user_id, code, event):
-    if code in activation_codes:
-        days = activation_codes.pop(code)
-        init_user_db(user_id)
-        current_exp = max(time.time(), users_db[user_id]["expires_at"])
-        users_db[user_id]["expires_at"] = current_exp + (days * 86400)
-        users_db[user_id].pop("expiry_notices", None)
-        _append_activation_log("تفعيل_كود_تسطير", user_id, days=days, tastir=True)
-        save_data()
-        
-        sender = await event.get_sender()
-        username = f"@{sender.username}" if sender and sender.username else "لا يوجد اسم مستخدم"
-        first_name = sender.first_name if sender and sender.first_name else "مستخدم"
-        user_link = f"[{first_name}](tg://openmessage?user_id={user_id})"
-        
-        notify_txt = (
-            "📩 إشعار اشتراك جديد:\n\n"
-            f"• المستخدم: {user_link}\n"
-            f"• المعرف: `{user_id}`\n"
-            f"• اسم المستخدم: {username}\n"
-            f"• مدة الاشتراك: {days} يوم\n"
-            f"• رمز التفعيل: `{code}`"
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, notify_txt)
-            except Exception:
-                pass
-                
-        return True, days
-    return False, 0
+    details = _pop_activation_code_details(activation_codes, code)
+    if not details:
+        return False, 0
+    days, issuer_id = details
+    init_user_db(user_id)
+    current_exp = max(time.time(), users_db[user_id]["expires_at"])
+    users_db[user_id]["expires_at"] = current_exp + (days * 86400)
+    users_db[user_id].pop("expiry_notices", None)
+    sender = await event.get_sender()
+    _remember_user_identity(user_id, sender)
+    _append_activation_log("تفعيل_كود_تسطير", user_id, admin_id=issuer_id, days=days, tastir=True, note=f"الكود: {code}")
+    save_data()
+    username = f"@{sender.username}" if sender and sender.username else "ماعنده"
+    first_name = sender.first_name if sender and sender.first_name else "مستخدم"
+    user_link = f"[{first_name}](tg://openmessage?user_id={user_id})"
+    issuer_text = await _issuer_details_text(issuer_id)
+    notify_txt = (
+        "📩 إشعار اشتراك جديد:\n\n"
+        f"• المستخدم: {user_link}\n"
+        f"• الآيدي: `{user_id}`\n"
+        f"• اليوزر: {username}\n"
+        f"• مدة الاشتراك: {days} يوم\n"
+        f"• رمز التفعيل: `{code}`\n\n"
+        f"👑 **منشئ الكود:**\n{issuer_text}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, notify_txt, link_preview=False)
+        except Exception:
+            pass
+    return True, days
 
 async def apply_source_activation_code(user_id, code, event):
-    if code in source_activation_codes:
-        days = source_activation_codes.pop(code)
-        init_user_db(user_id)
-        current_exp = max(time.time(), users_db[user_id].get("source_expires_at", 0))
-        users_db[user_id]["source_expires_at"] = current_exp + (days * 86400)
-        users_db[user_id].pop("expiry_notices", None)
-        _append_activation_log("تفعيل_كود_سورس", user_id, days=days, source=True)
-        save_data()
-        
-        sender = await event.get_sender()
-        username = f"@{sender.username}" if sender and sender.username else "لا يوجد اسم مستخدم"
-        first_name = sender.first_name if sender and sender.first_name else "مستخدم"
-        user_link = f"[{first_name}](tg://openmessage?user_id={user_id})"
-        
-        notify_txt = (
-            "📩 إشعار تفعيل مميزات السورس جديد:\n\n"
-            f"• المستخدم: {user_link}\n"
-            f"• المعرف: `{user_id}`\n"
-            f"• اسم المستخدم: {username}\n"
-            f"• مدة الاشتراك: {days} يوم\n"
-            f"• رمز تفعيل السورس: `{code}`"
-        )
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_message(admin_id, notify_txt)
-            except Exception:
-                pass
-                
-        return True, days
-    return False, 0
+    details = _pop_activation_code_details(source_activation_codes, code)
+    if not details:
+        return False, 0
+    days, issuer_id = details
+    init_user_db(user_id)
+    current_exp = max(time.time(), users_db[user_id].get("source_expires_at", 0))
+    users_db[user_id]["source_expires_at"] = current_exp + (days * 86400)
+    users_db[user_id].pop("expiry_notices", None)
+    sender = await event.get_sender()
+    _remember_user_identity(user_id, sender)
+    _append_activation_log("تفعيل_كود_سورس", user_id, admin_id=issuer_id, days=days, source=True, note=f"الكود: {code}")
+    save_data()
+    username = f"@{sender.username}" if sender and sender.username else "ماعنده"
+    first_name = sender.first_name if sender and sender.first_name else "مستخدم"
+    user_link = f"[{first_name}](tg://openmessage?user_id={user_id})"
+    issuer_text = await _issuer_details_text(issuer_id)
+    notify_txt = (
+        "📩 إشعار تفعيل مميزات السورس جديد:\n\n"
+        f"• المستخدم: {user_link}\n"
+        f"• الآيدي: `{user_id}`\n"
+        f"• اليوزر: {username}\n"
+        f"• مدة الاشتراك: {days} يوم\n"
+        f"• رمز تفعيل السورس: `{code}`\n\n"
+        f"👑 **منشئ الكود:**\n{issuer_text}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, notify_txt, link_preview=False)
+        except Exception:
+            pass
+    return True, days
+
+async def apply_full_activation_code(user_id, code, event):
+    details = _pop_activation_code_details(all_activation_codes, code)
+    if not details:
+        return False, 0
+    days, issuer_id = details
+    init_user_db(user_id)
+    now = time.time()
+    users_db[user_id]["expires_at"] = max(now, users_db[user_id].get("expires_at", 0)) + days * 86400
+    users_db[user_id]["source_expires_at"] = max(now, users_db[user_id].get("source_expires_at", 0)) + days * 86400
+    users_db[user_id].pop("expiry_notices", None)
+    sender = await event.get_sender()
+    _remember_user_identity(user_id, sender)
+    _append_activation_log("تفعيل_كود_جميع_الصلاحيات", user_id, admin_id=issuer_id, days=days, tastir=True, source=True, note=f"الكود: {code}")
+    save_data()
+    name = users_db[user_id].get("display_name", "مستخدم")
+    username = users_db[user_id].get("display_username", "ماعنده")
+    issuer_text = await _issuer_details_text(issuer_id)
+    notice = (
+        "📩 **تفعيل جميع الصلاحيات**\n\n"
+        f"• الاسم: {name}\n"
+        f"• الآيدي: `{user_id}`\n"
+        f"• اليوزر: {username}\n"
+        f"• المدة: `{days}` يوم\n"
+        f"• الكود: `{code}`\n\n"
+        f"👑 **منشئ الكود:**\n{issuer_text}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, notice, link_preview=False)
+        except Exception:
+            pass
+    return True, days
+
 
 async def search_and_download_youtube(query):
     def download():
@@ -646,13 +830,12 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
     return True
 
 async def resolve_target_user(event):
-    if event.is_private:
-        return event.chat_id
+    """يحدد المستخدم من الرد أو اليوزر أو الآيدي أو محادثة الخاص الحالية."""
     if event.reply_to_msg_id:
         reply_msg = await event.get_reply_message()
         if reply_msg and reply_msg.sender_id:
             return reply_msg.sender_id
-    text_parts = event.raw_text.split(maxsplit=1)
+    text_parts = (event.raw_text or "").split(maxsplit=1)
     if len(text_parts) > 1:
         arg = text_parts[1].strip()
         try:
@@ -660,28 +843,39 @@ async def resolve_target_user(event):
             return entity.id
         except Exception:
             pass
+    if event.is_private:
+        try:
+            peer = await event.get_chat()
+            return getattr(peer, "id", event.chat_id)
+        except Exception:
+            return event.chat_id
     return None
 
 async def check_user_ban_permissions(client, chat_entity, user):
+    """يتحقق من صلاحية الحظر الفعلية من صلاحيات العضو، للقروب والقناة."""
     try:
-        participant = await client.get_participant(chat_entity, user)
-        if getattr(participant, 'admin_rights', None) and participant.admin_rights.ban_users:
-            return True
-        if getattr(participant, 'is_creator', False) or isinstance(participant, (ChannelParticipantCreator,)):
-            return True
-        if hasattr(participant, 'admin') and participant.admin:
-            return True
-        
+        # get_permissions هي الواجهة المتوافقة مع Telethon؛ لا توجد get_participant في العميل.
         perms = await client.get_permissions(chat_entity, user)
-        if getattr(perms, 'ban_users', False) or getattr(perms, 'is_admin', False) or getattr(perms, 'is_creator', False):
-            return True
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[FLUSH PERMISSION CHECK] تعذر قراءة الصلاحيات: {type(exc).__name__}: {exc}")
+        return False
+
+    if getattr(perms, 'is_creator', False) or isinstance(perms, ChannelParticipantCreator):
+        return True
+
+    rights = getattr(perms, 'admin_rights', None)
+    if rights and getattr(rights, 'ban_users', False):
+        return True
+
+    # توافق مع بعض إصدارات Telethon التي تكشف الحق مباشرة على كائن الصلاحيات.
+    if getattr(perms, 'ban_users', False):
+        return True
+
     return False
 
 async def run_flush_process(client, chat_id, user_id, status_target):
     u_info = users_db.get(user_id, {})
-    speed = u_info.get("flush_speed", 0.5)
+    speed = 0.01
     me = await client.get_me()
     
     kicked_count = 0
@@ -728,6 +922,71 @@ async def run_flush_process(client, chat_id, user_id, status_target):
         except Exception:
             pass
 
+async def start_manual_flush_task(client, owner_id, target_chat, status_chat_id, mode="ban"):
+    """يشغل تفليشاً يدوياً قابلاً للإيقاف، بالحظر أو بالطرد، بعد التحقق من الصلاحية."""
+    target_entity = await client.get_entity(target_chat)
+    me = await client.get_me()
+    if not await check_user_ban_permissions(client, target_entity, me):
+        raise PermissionError("انت لست مرفوع بصلاحية حظر المستخدمين بالقروب/القناة")
+    task_key = (owner_id, int(target_entity.id))
+    previous = manual_flush_tasks.get(task_key)
+    if previous and not previous.done():
+        previous.cancel()
+
+    async def worker():
+        speed = 0.01
+        action_name = "الحظر" if mode == "ban" else "الطرد"
+        count = 0
+        failed = 0
+        status = await client.send_message(status_chat_id, f"⏳ جاري التفليش بـ{action_name}...")
+        try:
+            async for member in client.iter_participants(target_entity):
+                if member.id == me.id or getattr(member, "bot", False):
+                    continue
+                try:
+                    if mode == "ban":
+                        await client(EditBannedRequest(target_entity, member.id, ChatBannedRights(until_date=None, view_messages=True)))
+                    else:
+                        await client.delete_chat_user(target_entity, member.id)
+                    count += 1
+                    await asyncio.sleep(speed)
+                except Exception as exc:
+                    raw = str(exc).upper()
+                    if "FLOOD_WAIT" in raw:
+                        seconds = int(re.search(r"\d+", raw).group()) if re.search(r"\d+", raw) else 5
+                        await asyncio.sleep(seconds)
+                    elif any(marker in raw for marker in ("CHAT_ADMIN_REQUIRED", "RIGHTS_NOT_AVAILABLE", "USER_ADMIN_INVALID")):
+                        raise PermissionError("انسحبت صلاحية الحظر أو الطرد أثناء التفليش.")
+                    else:
+                        failed += 1
+        except asyncio.CancelledError:
+            await status.edit(f"⏹️ تم إيقاف التفليش.\n\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`")
+            raise
+        except Exception as exc:
+            await status.edit(f"⚠️ توقف التفليش.\n\n• السبب: {exc}\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`")
+        else:
+            await status.edit(f"✅ انتهى التفليش بـ{action_name}.\n\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`")
+        finally:
+            manual_flush_tasks.pop(task_key, None)
+
+    task = asyncio.create_task(worker())
+    manual_flush_tasks[task_key] = task
+    return target_entity
+
+
+async def stop_manual_flush_tasks(owner_id, target_chat_id=None):
+    stopped = 0
+    for key, task in list(manual_flush_tasks.items()):
+        if key[0] != owner_id:
+            continue
+        if target_chat_id is not None and key[1] != int(target_chat_id):
+            continue
+        if not task.done():
+            task.cancel()
+            stopped += 1
+    return stopped
+
+
 # ==================== Source Features: Profile, Publishing, Media & Data ====================
 def source_lock_message():
     return "⚠️ لا يمكنك استخدام أي ميزة بالسورس إلا بكود تفعيل. الرجاء التواصل مع المطور وإرسال كود تفعيل مميزات السورس."
@@ -758,24 +1017,162 @@ def _add_profile_history(owner_id, first_name, last_name, username):
         users_db[owner_id]["username_history"] = username_history[-30:]
 
 
+
+
+def _serialize_emoji_status(status):
+    if isinstance(status, EmojiStatus):
+        return {"kind": "emoji", "document_id": int(status.document_id)}
+    if isinstance(status, EmojiStatusCollectible):
+        return {
+            "kind": "collectible",
+            "collectible_id": int(status.collectible_id),
+            "document_id": int(status.document_id),
+            "title": status.title,
+            "slug": status.slug,
+            "pattern_document_id": int(status.pattern_document_id),
+            "center_color": int(status.center_color),
+            "edge_color": int(status.edge_color),
+            "pattern_color": int(status.pattern_color),
+            "text_color": int(status.text_color),
+        }
+    return {"kind": "empty"}
+
+
+def _deserialize_emoji_status(data):
+    data = data or {"kind": "empty"}
+    if data.get("kind") == "emoji" and data.get("document_id"):
+        return EmojiStatus(document_id=int(data["document_id"]))
+    if data.get("kind") == "collectible" and data.get("document_id"):
+        return EmojiStatusCollectible(
+            collectible_id=int(data["collectible_id"]),
+            document_id=int(data["document_id"]),
+            title=data.get("title") or "",
+            slug=data.get("slug") or "",
+            pattern_document_id=int(data.get("pattern_document_id") or 0),
+            center_color=int(data.get("center_color") or 0),
+            edge_color=int(data.get("edge_color") or 0),
+            pattern_color=int(data.get("pattern_color") or 0),
+            text_color=int(data.get("text_color") or 0),
+        )
+    return EmojiStatusEmpty()
+
+
+def _serialize_peer_color(color):
+    if not color:
+        return None
+    return {
+        "color": getattr(color, "color", None),
+        "background_emoji_id": getattr(color, "background_emoji_id", None),
+    }
+
+
+def _deserialize_peer_color(data):
+    if not data:
+        return None
+    return PeerColor(
+        color=data.get("color"),
+        background_emoji_id=data.get("background_emoji_id"),
+    )
+
+
+def _serialize_birthday(value):
+    if not value:
+        return None
+    return {"day": int(value.day), "month": int(value.month), "year": getattr(value, "year", None)}
+
+
+def _deserialize_birthday(data):
+    if not data:
+        return None
+    return Birthday(day=int(data["day"]), month=int(data["month"]), year=data.get("year"))
+
+
+def _serialize_business_location(value):
+    if not value:
+        return None
+    point = getattr(value, "geo_point", None)
+    return {
+        "address": getattr(value, "address", "") or "",
+        "lat": getattr(point, "lat", None) if point else None,
+        "long": getattr(point, "long", None) if point else None,
+        "accuracy_radius": getattr(point, "accuracy_radius", None) if point else None,
+    }
+
+
+def _deserialize_business_location(data):
+    if not data:
+        return None
+    point = None
+    if data.get("lat") is not None and data.get("long") is not None:
+        point = InputGeoPoint(
+            lat=float(data["lat"]), long=float(data["long"]),
+            accuracy_radius=data.get("accuracy_radius")
+        )
+    return BusinessLocation(address=data.get("address") or "", geo_point=point)
+
+
+def _serialize_business_work_hours(value):
+    if not value:
+        return None
+    return {
+        "timezone_id": getattr(value, "timezone_id", "UTC") or "UTC",
+        "open_now": getattr(value, "open_now", None),
+        "weekly_open": [
+            {"start_minute": int(item.start_minute), "end_minute": int(item.end_minute)}
+            for item in (getattr(value, "weekly_open", None) or [])
+        ],
+    }
+
+
+def _deserialize_business_work_hours(data):
+    if not data:
+        return None
+    return BusinessWorkHours(
+        timezone_id=data.get("timezone_id") or "UTC",
+        open_now=data.get("open_now"),
+        weekly_open=[
+            BusinessWeeklyOpen(start_minute=int(item["start_minute"]), end_minute=int(item["end_minute"]))
+            for item in data.get("weekly_open", [])
+        ],
+    )
+
+
+async def delete_message_after(message, seconds):
+    """يحذف النتيجة المختصرة لاحقاً من دون تعطيل الأمر."""
+    if not message:
+        return
+    try:
+        await asyncio.sleep(seconds)
+        await message.delete()
+    except Exception:
+        pass
+
 async def apply_profile_template(client, owner_id, target):
     """يحفظ المظهر الحالي ثم يطبق الاسم والبايو والصورة القابلة للتعديل من الحساب الهدف."""
     init_user_db(owner_id)
     me = await client.get_me()
-    full_me = await client(GetFullUserRequest(me))
-    old_bio = getattr(full_me.full_user, "about", "") or ""
-    old_photo = os.path.join(TEMP_DIR, f"profile_backup_{owner_id}.jpg")
-    _safe_remove(old_photo)
-    downloaded_old_photo = await client.download_profile_photo(me, file=old_photo)
-
-    users_db[owner_id]["profile_backup"] = {
-        "first_name": me.first_name or "",
-        "last_name": me.last_name or "",
-        "about": old_bio,
-        "photo_path": downloaded_old_photo if downloaded_old_photo else None,
-        "saved_at": int(time.time())
-    }
-    _add_profile_history(owner_id, me.first_name, me.last_name, me.username)
+    # تحفظ الهوية الحالية لأول انتحال فقط. لا تستبدلها الانتحالات التالية.
+    if not users_db[owner_id].get("profile_backup"):
+        full_me = await client(GetFullUserRequest(me))
+        current_full = getattr(full_me, "full_user", None)
+        old_bio = getattr(current_full, "about", "") or ""
+        old_photo = os.path.join(TEMP_DIR, f"profile_backup_{owner_id}.jpg")
+        _safe_remove(old_photo)
+        downloaded_old_photo = await client.download_profile_photo(me, file=old_photo)
+        users_db[owner_id]["profile_backup"] = {
+            "first_name": me.first_name or "",
+            "last_name": me.last_name or "",
+            "about": old_bio,
+            "photo_path": downloaded_old_photo if downloaded_old_photo else None,
+            "emoji_status": _serialize_emoji_status(getattr(me, "emoji_status", None)),
+            "name_color": _serialize_peer_color(getattr(me, "color", None)),
+            "profile_color": _serialize_peer_color(getattr(me, "profile_color", None)),
+            "birthday": _serialize_birthday(getattr(current_full, "birthday", None)),
+            "business_location": _serialize_business_location(getattr(current_full, "business_location", None)),
+            "business_work_hours": _serialize_business_work_hours(getattr(current_full, "business_work_hours", None)),
+            "saved_at": int(time.time())
+        }
+        _add_profile_history(owner_id, me.first_name, me.last_name, me.username)
 
     target_full = await client(GetFullUserRequest(target))
     target_bio = getattr(target_full.full_user, "about", "") or ""
@@ -793,6 +1190,46 @@ async def apply_profile_template(client, owner_id, target):
         uploaded = await client.upload_file(downloaded_target_photo)
         await client(UploadProfilePhotoRequest(file=uploaded))
         _safe_remove(downloaded_target_photo)
+
+    # نسخ عناصر مظهر بريم عند توفر الصلاحية على الحساب الذي ينفذ الانتحال.
+    if getattr(me, "premium", False):
+        try:
+            target_status = getattr(target, "emoji_status", None) or EmojiStatusEmpty()
+            await client(UpdateEmojiStatusRequest(emoji_status=target_status))
+        except Exception as exc:
+            print(f"[CLONE STYLE] تعذر نسخ الحالة المميزة: {type(exc).__name__}")
+        try:
+            await client(UpdateColorRequest(for_profile=False, color=getattr(target, "color", None)))
+        except Exception as exc:
+            print(f"[CLONE STYLE] تعذر نسخ لون الاسم: {type(exc).__name__}")
+        try:
+            await client(UpdateColorRequest(for_profile=True, color=getattr(target, "profile_color", None)))
+        except Exception as exc:
+            print(f"[CLONE STYLE] تعذر نسخ لون أو خلفية الملف: {type(exc).__name__}")
+
+    # حقول التاريخ والموقع وأوقات العمل تعمل فقط للحسابات التي يسمح لها تيليجرام بها.
+    target_full_user = getattr(target_full, "full_user", None)
+    try:
+        await client(UpdateBirthdayRequest(birthday=getattr(target_full_user, "birthday", None)))
+    except Exception as exc:
+        print(f"[CLONE BUSINESS] تعذر نسخ التاريخ: {type(exc).__name__}")
+    try:
+        target_location = getattr(target_full_user, "business_location", None)
+        if target_location:
+            target_geo = getattr(target_location, "geo_point", None)
+            input_geo = None
+            if target_geo and getattr(target_geo, "lat", None) is not None:
+                input_geo = InputGeoPoint(lat=target_geo.lat, long=target_geo.long, accuracy_radius=getattr(target_geo, "accuracy_radius", None))
+            await client(UpdateBusinessLocationRequest(geo_point=input_geo, address=getattr(target_location, "address", "") or ""))
+        else:
+            await client(UpdateBusinessLocationRequest(geo_point=None, address=""))
+    except Exception as exc:
+        print(f"[CLONE BUSINESS] تعذر نسخ الموقع: {type(exc).__name__}")
+    try:
+        target_hours = getattr(target_full_user, "business_work_hours", None)
+        await client(UpdateBusinessWorkHoursRequest(business_work_hours=target_hours))
+    except Exception as exc:
+        print(f"[CLONE BUSINESS] تعذر نسخ أوقات العمل: {type(exc).__name__}")
 
     save_data()
     return target.first_name or "مستخدم"
@@ -824,25 +1261,158 @@ async def restore_profile_template(client, owner_id):
         uploaded = await client.upload_file(photo_path)
         await client(UploadProfilePhotoRequest(file=uploaded))
 
+    # تعيد عناصر المظهر المحفوظة إن كانت متاحة للحساب الحالي.
+    try:
+        await client(UpdateEmojiStatusRequest(emoji_status=_deserialize_emoji_status(backup.get("emoji_status"))))
+    except Exception:
+        pass
+    try:
+        await client(UpdateColorRequest(for_profile=False, color=_deserialize_peer_color(backup.get("name_color"))))
+    except Exception:
+        pass
+    try:
+        await client(UpdateColorRequest(for_profile=True, color=_deserialize_peer_color(backup.get("profile_color"))))
+    except Exception:
+        pass
+    try:
+        await client(UpdateBirthdayRequest(birthday=_deserialize_birthday(backup.get("birthday"))))
+    except Exception:
+        pass
+    try:
+        location = _deserialize_business_location(backup.get("business_location"))
+        if location:
+            await client(UpdateBusinessLocationRequest(geo_point=location.geo_point, address=location.address))
+        else:
+            await client(UpdateBusinessLocationRequest(geo_point=None, address=""))
+    except Exception:
+        pass
+    try:
+        hours = _deserialize_business_work_hours(backup.get("business_work_hours"))
+        await client(UpdateBusinessWorkHoursRequest(business_work_hours=hours))
+    except Exception:
+        pass
+
     me = await client.get_me()
     _add_profile_history(owner_id, me.first_name, me.last_name, me.username)
+    # بعد الإعادة تحذف النسخة المؤقتة حتى يتم حفظ وضعك الجديد عند أول انتحال تالٍ.
+    users_db[owner_id].pop("profile_backup", None)
     save_data()
 
 
+def _publish_job_list(owner_id):
+    init_user_db(owner_id)
+    return users_db[owner_id].setdefault("auto_publish_jobs", [])
+
+
+def _remove_persisted_publish_job(owner_id, target_chat_id):
+    target = int(target_chat_id)
+    jobs = _publish_job_list(owner_id)
+    users_db[owner_id]["auto_publish_jobs"] = [job for job in jobs if int(job.get("target_chat_id", 0)) != target]
+    save_data()
+
+
+def _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed=0, origin_chat_id=None):
+    target = int(target_chat_id)
+    source_chat_id = getattr(source_message, "chat_id", None)
+    source_message_id = getattr(source_message, "id", None)
+    if source_chat_id is None or source_message_id is None:
+        raise ValueError("تعذر حفظ مصدر رسالة النشر لاستعادتها لاحقاً.")
+    job = {
+        "target_chat_id": target,
+        "source_chat_id": int(source_chat_id),
+        "source_message_id": int(source_message_id),
+        "delay": float(delay),
+        "count": int(count),
+        "forward_mode": bool(forward_mode),
+        "completed": int(completed),
+        "origin_chat_id": int(origin_chat_id) if origin_chat_id is not None else int(source_chat_id),
+        "updated_at": int(time.time()),
+    }
+    jobs = [item for item in _publish_job_list(owner_id) if int(item.get("target_chat_id", 0)) != target]
+    jobs.append(job)
+    users_db[owner_id]["auto_publish_jobs"] = jobs
+    save_data()
+    return job
+
+
+def _update_publish_completed(owner_id, target_chat_id, completed):
+    target = int(target_chat_id)
+    for job in _publish_job_list(owner_id):
+        if int(job.get("target_chat_id", 0)) == target:
+            job["completed"] = int(completed)
+            job["updated_at"] = int(time.time())
+            save_data()
+            return
+
+
+def _translate_publish_error(error):
+    raw = str(error or "").strip()
+    if raw.startswith("تحويل الوسائط مقيّد"):
+        return raw
+    normalized = raw.upper()
+    if "YOU CAN'T WRITE IN THIS CHAT" in normalized or "CHAT_WRITE_FORBIDDEN" in normalized:
+        return "تم تقييدك من الكتابة في هذا القروب أو القناة."
+    if "CHAT_SEND_MEDIA_FORBIDDEN" in normalized or "MEDIA_FORBIDDEN" in normalized:
+        return "لا تملك صلاحية إرسال الوسائط في هذا القروب أو القناة."
+    if "USER_BANNED_IN_CHANNEL" in normalized or "USER_BANNED" in normalized:
+        return "تم حظر الحساب من هذا القروب أو القناة."
+    if "CHAT_ADMIN_REQUIRED" in normalized or "RIGHTS_NOT_AVAILABLE" in normalized:
+        return "لا تملك الصلاحية اللازمة للنشر هنا."
+    if "PROTECTED CHAT" in normalized or "FORWARDS_RESTRICTED" in normalized or ("FORWARD" in normalized and "RESTRICT" in normalized):
+        return "رفض تيليجرام التحويل لهذه الرسالة؛ جرّب التحويل اليدوي من الحساب للتأكد من صلاحية المصدر والوجهة."
+    if "MESSAGE_ID_INVALID" in normalized:
+        return "تعذر الوصول إلى رسالة المصدر للتحويل؛ أعد الرد على الرسالة ثم شغّل النشر من جديد."
+    if "CHANNEL_PRIVATE" in normalized or "CHAT_PRIVATE" in normalized:
+        return "القروب أو القناة خاص ولا يستطيع الحساب الوصول إليه."
+    if "PEER_ID_INVALID" in normalized or "USERNAME_NOT_OCCUPIED" in normalized:
+        return "معرف القروب أو القناة غير صحيح أو لم يعد متاحاً."
+    if "FLOOD_WAIT" in normalized:
+        return "تم تقييد الحساب مؤقتاً من تيليجرام بسبب كثرة العمليات."
+    if "AUTH_KEY_UNREGISTERED" in normalized or "SESSION_REVOKED" in normalized:
+        return "انتهت جلسة الحساب أو تم إلغاؤها؛ يلزم تسجيل الدخول للحساب مرة أخرى."
+    if "TIMEOUT" in normalized or "TIMEDOUT" in normalized:
+        return "انقطع الاتصال مؤقتاً أثناء النشر؛ سيحاول البوت الاستعادة تلقائياً."
+    if "TYPEERROR" in normalized or "VALUEERROR" in normalized:
+        return "تعذر تجهيز رسالة النشر؛ أعد الرد على الرسالة المطلوبة ثم شغّل النشر من جديد."
+    if "RPCERROR" in normalized or "BAD_REQUEST" in normalized:
+        return "رفض تيليجرام عملية النشر؛ تحقق من صلاحية الحساب والقروب ومصدر الرسالة."
+    return "تعذر إكمال النشر بسبب خطأ من تيليجرام؛ أعد المحاولة بعد ثوانٍ."
+
+
+def _is_transient_publish_error(error):
+    """يُبقي المهمة حية عند أخطاء الشبكة المؤقتة بدلاً من إيقاف كل النشر."""
+    normalized = str(error or "").upper()
+    transient_markers = (
+        "TIMEOUT", "TIMEDOUT", "CONNECTION", "NETWORK", "SERVER_ERROR",
+        "RPC_CALL_FAIL", "RESET BY PEER", "TRANSPORT",
+    )
+    return any(marker in normalized for marker in transient_markers)
+
+
 async def _publish_message(client, target_chat_id, source_message, forward_mode=False):
-    """ينشر بتحويل صريح أو بنسخ مخفي المصدر افتراضياً."""
+    """ينشر نسخة بلا مصدر افتراضياً، أو تحويلاً مباشراً طبيعياً عند كتابة «تحويل»."""
     if forward_mode:
+        # نفس واجهة Telethon المباشرة: تمرير الرسالة الأصلية للوجهة كما في التحويل الطبيعي للحساب.
         await client.forward_messages(target_chat_id, source_message)
         return
-    from telethon.tl.functions.messages import ForwardMessagesRequest
-    target_peer = await client.get_input_entity(target_chat_id)
-    await client(ForwardMessagesRequest(
-        from_peer=source_message.peer_id,
-        id=[source_message.id],
-        to_peer=target_peer,
-        drop_author=True,
-        random_id=[secrets.randbits(63)]
-    ))
+
+    text = getattr(source_message, "message", None) or ""
+    entities = getattr(source_message, "entities", None)
+    media = getattr(source_message, "media", None)
+    if media is not None and getattr(source_message, "file", None) is not None:
+        await client.send_file(
+            target_chat_id,
+            media,
+            caption=text or None,
+            formatting_entities=entities,
+        )
+        return
+    await client.send_message(
+        target_chat_id,
+        text or "\u2063",
+        formatting_entities=entities,
+        link_preview=bool(getattr(source_message, "web_preview", None)),
+    )
 
 
 async def _publish_target_name(client, target_chat_id):
@@ -853,64 +1423,327 @@ async def _publish_target_name(client, target_chat_id):
         return str(target_chat_id)
 
 
-async def _send_publish_stop_notice(owner_id, target_name, reason):
-    text = f"• تم إيقاف النشر في {target_name}\n• السبب ← {reason}"
+async def _send_publish_stop_notice(owner_id, target_name, target_chat_id, reason):
+    text = (
+        "⚠️ **تم إيقاف النشر**\n\n"
+        f"• القروب/القناة ← **{target_name}**\n"
+        f"• الآيدي ← `{target_chat_id}`\n"
+        f"• السبب ← {reason}"
+    )
     try:
         await bot.send_message(owner_id, text)
     except Exception:
         pass
 
 
+def _parse_join_target(value):
+    target = str(value or "").strip()
+    if not target:
+        raise ValueError("الرابط أو اليوزر فارغ.")
+    lower = target.lower()
+    # بعض الأزرار تستخدم رابط Telegram الداخلي بدلاً من t.me.
+    if lower.startswith("tg://resolve?"):
+        match = re.search(r"(?:^|[?&])domain=([^&]+)", target, flags=re.I)
+        if match:
+            target = "@" + match.group(1).strip()
+            lower = target.lower()
+    if "telegram.me/" in lower:
+        target = "https://t.me/" + target.split("telegram.me/", 1)[1]
+        lower = target.lower()
+    if "t.me/+" in lower:
+        return "invite", target.split("+")[-1].split("?")[0]
+    if "t.me/joinchat/" in lower:
+        return "invite", target.rstrip("/").split("/")[-1].split("?")[0]
+    if "t.me/" in lower:
+        target = "@" + target.rstrip("/").split("/")[-1].split("?")[0]
+    if target.startswith("@") or target.lstrip("-").isdigit():
+        return "public", target
+    raise ValueError("رابط أو يوزر اشتراك غير صالح.")
+
+
+def _is_publish_write_block(error):
+    text = str(error or "").upper()
+    return any(marker in text for marker in (
+        "YOU CAN'T WRITE IN THIS CHAT", "CHAT_WRITE_FORBIDDEN",
+        "CHAT_SEND_MEDIA_FORBIDDEN", "USER_BANNED_IN_CHANNEL",
+    ))
+
+
+def _extract_join_targets_from_message(message):
+    """يستخرج روابط الاشتراك من أزرار ورسالة بوت الاشتراك الإجباري."""
+    targets = []
+    seen = set()
+
+    def add(value):
+        if not value:
+            return
+        value = str(value).strip()
+        try:
+            _parse_join_target(value)
+        except ValueError:
+            return
+        if value not in seen:
+            seen.add(value)
+            targets.append(value)
+
+    for row in (getattr(message, "buttons", None) or []):
+        for button in row:
+            add(getattr(button, "url", None))
+
+    raw_text = getattr(message, "raw_text", "") or ""
+    for link in re.findall(r"(?:https?://)?t\.me/(?:joinchat/|\+)?[A-Za-z0-9_+\-]+", raw_text, flags=re.I):
+        add(link)
+    return targets
+
+
+async def _join_publish_target(client, target):
+    """يعيد joined عند الدخول الفوري، أو pending عند إرسال طلب يحتاج موافقة أدمن."""
+    kind, value = _parse_join_target(target)
+    if kind == "invite":
+        invite_info = await client(CheckChatInviteRequest(value))
+        if getattr(invite_info, "request_needed", False):
+            await client(ImportChatInviteRequest(value))
+            return "pending"
+        await client(ImportChatInviteRequest(value))
+        return "joined"
+    entity = await client.get_entity(value)
+    result = await client(JoinChannelRequest(entity))
+    result_name = type(result).__name__.lower()
+    if "request" in result_name or "pending" in result_name:
+        return "pending"
+    return "joined"
+
+
+def _remember_discovered_subscription(owner_id, target):
+    init_user_db(owner_id)
+    items = users_db[owner_id].setdefault("publish_required_chats", [])
+    if target not in items:
+        items.append(target)
+        save_data()
+
+
+async def _press_subscription_check_buttons(client, message):
+    """يضغط فقط أزرار التحقق الآمنة بعد الانضمام لكي يعترف بوت الاشتراك بالعضوية."""
+    pressed = False
+    check_words = ("تحقق", "تأكيد", "فحص", "check", "verify")
+    try:
+        peer = await client.get_input_entity(message.chat_id)
+        for row in (getattr(message, "buttons", None) or []):
+            for button in row:
+                label = (getattr(button, "text", "") or "").lower()
+                data = getattr(button, "data", None)
+                if data and any(word in label for word in check_words):
+                    await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=message.id, data=data))
+                    pressed = True
+    except Exception:
+        pass
+    return pressed
+
+
+async def resolve_forced_subscription_from_chat(client, owner_id, target_chat_id, attempted_targets=None):
+    """يقرأ اشتراكات القروب من أزرار/روابط الرسائل، ينضم للجديد منها ثم يضغط تحقق.
+
+    attempted_targets يحتفظ بما عولج في مهمة النشر الحالية، لذلك لا يدور البوت على
+    الرابط نفسه إذا ظهر شرط اشتراك جديد بعده.
+    """
+    discovered = []
+    check_messages = []
+    attempted_targets = attempted_targets if attempted_targets is not None else set()
+    try:
+        async for message in client.iter_messages(target_chat_id, limit=100):
+            if getattr(message, "out", False):
+                continue
+            # بعض أنظمة الاشتراك ترسل الرسالة من بوت، وبعضها من حساب أو خدمة أخرى.
+            # نعتمد على وجود أزرار/روابط وكلمات الاشتراك بدلاً من نوع المرسل فقط.
+            raw_text = (getattr(message, "raw_text", "") or "").lower()
+            buttons = getattr(message, "buttons", None) or []
+            subscription_words = ("اشتراك", "اشترك", "subscribe", "channel", "قناة", "تحقق", "تأكيد")
+            if not buttons and not any(word in raw_text for word in subscription_words):
+                continue
+            candidates = _extract_join_targets_from_message(message)
+            if candidates:
+                discovered.extend(candidates)
+                check_messages.append(message)
+
+        unique_targets = []
+        for target in discovered:
+            if target not in unique_targets and target not in attempted_targets:
+                unique_targets.append(target)
+        if not unique_targets:
+            return False, "لم أجد اشتراكاً إجبارياً جديداً قابلاً للانضمام؛ قد يحتاج الشرط موافقة أدمن أو رابطاً صالحاً.", []
+
+        joined_or_known = 0
+        pending_targets = []
+        for target in unique_targets:
+            try:
+                join_state = await _join_publish_target(client, target)
+                _remember_discovered_subscription(owner_id, target)
+                attempted_targets.add(target)
+                if join_state == "pending":
+                    pending_targets.append(target)
+                else:
+                    joined_or_known += 1
+            except Exception as e:
+                error_text = str(e).upper()
+                if "USER_ALREADY_PARTICIPANT" in error_text or ("ALREADY" in error_text and "PARTICIPANT" in error_text):
+                    _remember_discovered_subscription(owner_id, target)
+                    attempted_targets.add(target)
+                    joined_or_known += 1
+                    continue
+                return False, f"تعذر الاشتراك في `{target}`: {_translate_publish_error(e)}", []
+
+        for message in check_messages:
+            await _press_subscription_check_buttons(client, message)
+        details = []
+        if joined_or_known:
+            details.append(f"تمت معالجة {joined_or_known} اشتراك إجباري")
+        if pending_targets:
+            details.append(f"تم إرسال {len(pending_targets)} طلب انضمام بانتظار موافقة الأدمن")
+        return bool(joined_or_known or pending_targets), "؛ ".join(details) + ".", pending_targets
+    except Exception as e:
+        return False, _translate_publish_error(e), []
+
+
+async def ensure_publish_required_chats(client, owner_id):
+    """ينضم الحساب تلقائياً فقط إلى القوائم التي أضافها مالك الحساب بنفسه."""
+    required = list(users_db.get(owner_id, {}).get("publish_required_chats", []))
+    joined = []
+    for target in required:
+        try:
+            kind, value = _parse_join_target(target)
+            if kind == "invite":
+                await client(ImportChatInviteRequest(value))
+            else:
+                entity = await client.get_entity(value)
+                await client(JoinChannelRequest(entity))
+            joined.append(str(target))
+        except Exception as e:
+            message = str(e).upper()
+            if "USER_ALREADY_PARTICIPANT" in message or "ALREADY" in message and "PARTICIPANT" in message:
+                continue
+            return False, _translate_publish_error(e), str(target)
+    return True, "", joined
+
+
 async def check_publish_permission(client, target_chat_id, owner_id=None):
-    """يفحص حق الإرسال قبل إنشاء مهمة النشر، دون إرسال رسالة اختبار للوجهة."""
+    """يفحص حق الإرسال الفعلي قبل إنشاء مهمة النشر، دون إرسال رسالة اختبار للوجهة."""
     try:
         entity = await client.get_entity(target_chat_id)
         name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(target_chat_id)
+        me = await client.get_me()
+        perms = await client.get_permissions(entity, me)
+        if getattr(perms, "is_banned", False) or getattr(perms, "send_messages", None) is False:
+            return False, name, "لا تستطيع الإرسال هنا؛ ربما تم تقييدك أو حظرك."
+        # في القنوات يلزم أن يكون الحساب مالكاً أو أدمن ويملك post_messages فعلياً.
         if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
-            perms = await client.get_permissions(entity, "me")
-            if getattr(perms, "is_banned", False) or getattr(perms, "send_messages", None) is False:
-                return False, name, "لا تستطيع النشر في هذه القناة؛ أنت محظور أو لا تملك صلاحية الإرسال."
-            if not (getattr(perms, "is_admin", False) or getattr(perms, "is_creator", False)):
+            if getattr(perms, "is_creator", False):
+                return True, name, ""
+            if not getattr(perms, "is_admin", False):
                 return False, name, "لا تستطيع النشر في هذه القناة؛ يجب أن تكون مالكاً أو أدمن بصلاحية النشر."
-        else:
-            perms = await client.get_permissions(entity, "me")
-            if getattr(perms, "is_banned", False) or getattr(perms, "send_messages", None) is False:
-                return False, name, "لا تستطيع الإرسال في هذه المجموعة؛ ربما تم تقييدك أو حظرك."
+            rights = getattr(perms, "admin_rights", None)
+            if rights is not None and not getattr(rights, "post_messages", False):
+                return False, name, "أنت أدمن في القناة لكن لا تملك صلاحية نشر الرسائل."
         return True, name, ""
     except Exception as e:
         if owner_id is not None:
             await report_admin_error("فحص صلاحيات النشر", e, owner_id, target_chat_id)
-        return False, str(target_chat_id), f"تعذر فحص صلاحية الإرسال: {e}"
+        return False, str(target_chat_id), _translate_publish_error(e)
 
 
-async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False):
+async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False, completed=0, origin_chat_id=None, restored=False, pending_approval_targets=None):
     task_key = (owner_id, int(target_chat_id))
     old_task = auto_publish_tasks.get(task_key)
     if old_task and not old_task.done():
         await stop_auto_publish_task(client, owner_id, target_chat_id, "تم استبدال عملية النشر بعملية جديدة")
+    job = _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed, origin_chat_id)
 
     async def publish_loop():
-        completed = 0
+        sent = int(job.get("completed", 0))
         target_name = await _publish_target_name(client, target_chat_id)
+        transient_notice_sent = False
+        # كل رابط يُعالج مرة واحدة فقط. يدعم التسلسل الطويل للاشتراكات من دون حلقة غير منتهية.
+        forced_subscription_targets = set()
+        max_forced_subscription_targets = 50
+        active_pending_approval_targets = list(pending_approval_targets or [])
+        approval_wait_notice_sent = False
         try:
-            while completed < count:
-                await _publish_message(client, target_chat_id, source_message, forward_mode)
-                completed += 1
-                if completed < count:
+            while sent < count:
+                try:
+                    await _publish_message(client, target_chat_id, source_message, forward_mode)
+                except Exception as e:
+                    if _is_publish_write_block(e):
+                        # إذا كان هناك طلب انضمام أُرسل بالفعل، ننتظر قبول الأدمن ثم نعيد نفس الرسالة.
+                        if active_pending_approval_targets:
+                            if not approval_wait_notice_sent:
+                                try:
+                                    await bot.send_message(
+                                        owner_id,
+                                        "⏳ تم إرسال طلب انضمام للاشتراك الإجباري، لكن القروب يحتاج موافقة الأدمن. "
+                                        "ستبقى مهمة النشر منتظرة وستكمل تلقائياً فور الموافقة."
+                                    )
+                                except Exception:
+                                    pass
+                                approval_wait_notice_sent = True
+                            await asyncio.sleep(60)
+                            continue
+                        if len(forced_subscription_targets) < max_forced_subscription_targets:
+                            resolved, resolve_note, new_pending_targets = await resolve_forced_subscription_from_chat(
+                                client, owner_id, target_chat_id, forced_subscription_targets
+                            )
+                            if resolved:
+                                # لا يزيد sent هنا؛ يعاد إرسال الرسالة نفسها بعد معالجة كل اشتراك جديد.
+                                if new_pending_targets:
+                                    active_pending_approval_targets.extend(new_pending_targets)
+                                await asyncio.sleep(2)
+                                continue
+                    if not _is_transient_publish_error(e):
+                        raise
+                    # لا نوقف 14 حساباً عند انقطاع مؤقت؛ ننتظر ثم نعيد المحاولة على نفس الرسالة.
+                    if not transient_notice_sent:
+                        try:
+                            await bot.send_message(owner_id, f"⚠️ تعذر الاتصال مؤقتاً أثناء النشر في **{target_name}**. سيحاول ديمون الاستعادة تلقائياً.")
+                        except Exception:
+                            pass
+                        transient_notice_sent = True
+                    await asyncio.sleep(15)
+                    continue
+                transient_notice_sent = False
+                active_pending_approval_targets.clear()
+                approval_wait_notice_sent = False
+                sent += 1
+                _update_publish_completed(owner_id, target_chat_id, sent)
+                if sent < count:
                     await asyncio.sleep(delay)
         except asyncio.CancelledError:
             reason = publish_stop_reasons.pop(task_key, "تم إيقاف النشر يدوياً")
-            await _send_publish_stop_notice(owner_id, target_name, reason)
+            _remove_persisted_publish_job(owner_id, target_chat_id)
+            await _send_publish_stop_notice(owner_id, target_name, target_chat_id, reason)
             raise
         except Exception as e:
+            print(f"[PUBLISH ERROR] owner={owner_id} target={target_chat_id} type={type(e).__name__} raw={e}")
             await report_admin_error("توقف النشر التلقائي", e, owner_id, target_chat_id)
-            await _send_publish_stop_notice(owner_id, target_name, str(e))
+            _remove_persisted_publish_job(owner_id, target_chat_id)
+            await _send_publish_stop_notice(owner_id, target_name, target_chat_id, _translate_publish_error(e))
+        else:
+            _remove_persisted_publish_job(owner_id, target_chat_id)
+            try:
+                await bot.send_message(owner_id, f"✅ اكتمل النشر في **{target_name}** بعد إرسال {sent} رسالة.")
+            except Exception:
+                pass
         finally:
             auto_publish_tasks.pop(task_key, None)
+            auto_publish_meta.pop(task_key, None)
             publish_stop_reasons.pop(task_key, None)
 
     task = asyncio.create_task(publish_loop())
     auto_publish_tasks[task_key] = task
+    auto_publish_meta[task_key] = job
+    if restored:
+        target_name = await _publish_target_name(client, target_chat_id)
+        try:
+            await bot.send_message(owner_id, f"♻️ تم استئناف النشر تلقائياً في **{target_name}** من الرسالة رقم {int(completed) + 1}.")
+        except Exception:
+            pass
     return task_key
 
 
@@ -924,6 +1757,32 @@ async def stop_auto_publish_task(client, owner_id, target_chat_id=None, reason="
                 task.cancel()
                 stopped += 1
     return stopped
+
+
+async def restore_auto_publish_jobs(client, owner_id):
+    """يعيد تشغيل المهام المحفوظة؛ أي منع اشتراك يعالج داخل دورة النشر نفسها."""
+    jobs = list(users_db.get(owner_id, {}).get("auto_publish_jobs", []))
+    for job in jobs:
+        target_chat_id = int(job.get("target_chat_id", 0))
+        if not target_chat_id:
+            continue
+        task_key = (owner_id, target_chat_id)
+        if task_key in auto_publish_tasks and not auto_publish_tasks[task_key].done():
+            continue
+        try:
+            source_message = await client.get_messages(int(job["source_chat_id"]), ids=int(job["source_message_id"]))
+            if not source_message:
+                raise RuntimeError("رسالة مصدر النشر لم تعد متاحة للحساب.")
+            await start_auto_publish_task(
+                client, owner_id, target_chat_id, source_message,
+                float(job.get("delay", 1.0)), int(job.get("count", 1)),
+                bool(job.get("forward_mode", False)), int(job.get("completed", 0)),
+                job.get("origin_chat_id"), restored=True,
+            )
+        except Exception as e:
+            _remove_persisted_publish_job(owner_id, target_chat_id)
+            target_name = await _publish_target_name(client, target_chat_id)
+            await _send_publish_stop_notice(owner_id, target_name, target_chat_id, "تعذر استئناف المهمة: " + _translate_publish_error(e))
 
 
 async def convert_to_image(client, source_message, destination, reply_to=None):
@@ -1152,13 +2011,16 @@ def estimated_creation_year(user_id):
     return "أحدث من 2024"
 
 
-async def get_user_entity_from_command(client, event, command_parts):
+async def get_user_entity_from_command(client, event, command_parts, private_peer=False):
+    """يدعم الرد والمنشن والآيدي، ويستهدف الطرف الآخر تلقائياً في الخاص."""
     if event.reply_to_msg_id:
         reply = await event.get_reply_message()
         if reply and reply.sender_id:
             return await client.get_entity(reply.sender_id)
     if len(command_parts) > 1:
         return await client.get_entity(command_parts[1])
+    if event.is_private or private_peer and event.is_private:
+        return await event.get_chat()
     return await client.get_me()
 
 
@@ -1167,6 +2029,78 @@ async def build_direct_account_link(entity):
     if username:
         return f"https://t.me/{username}"
     return f"tg://openmessage?user_id={entity.id}"
+
+
+async def build_account_inspection_report(client, target):
+    """يجمع فقط بيانات الحساب التي يتيحها تيليجرام للحساب الطالب."""
+    full = await client(GetFullUserRequest(target))
+    full_user = getattr(full, "full_user", None)
+    about = getattr(full_user, "about", None) or "ما عنده بايو"
+    common_count = getattr(full_user, "common_chats_count", 0) or 0
+    phone = getattr(full_user, "phone", None) or getattr(target, "phone", None)
+    phone_text = phone if phone else "مخفي أو غير متاح"
+    try:
+        photos = await client(GetUserPhotosRequest(user_id=target, offset=0, max_id=0, limit=1))
+        photo_count = int(getattr(photos, "count", len(getattr(photos, "photos", []) or [])))
+    except Exception:
+        photo_count = "غير متاح"
+
+    # الحوار الخاص يعني أن الحساب ظاهر ضمن محادثات هذا الحساب، من دون كشف محتوى المحادثة.
+    private_chat = False
+    try:
+        async for dialog in client.iter_dialogs(limit=None):
+            if getattr(dialog.entity, "id", None) == target.id:
+                private_chat = True
+                break
+    except Exception:
+        pass
+
+    flags = []
+    if getattr(target, "verified", False):
+        flags.append("موثّق")
+    if getattr(target, "premium", False):
+        flags.append("بريميوم")
+    if getattr(target, "bot", False):
+        flags.append("بوت")
+    if getattr(target, "scam", False):
+        flags.append("معلّم كمشبوه")
+    if getattr(target, "fake", False):
+        flags.append("معلّم كمزيّف")
+    if getattr(target, "restricted", False):
+        flags.append("مقيّد")
+    if getattr(target, "deleted", False):
+        flags.append("حساب محذوف")
+    account_flags = "، ".join(flags) if flags else "حساب عادي"
+
+    status_name = type(getattr(target, "status", None)).__name__
+    status_map = {
+        "UserStatusOnline": "متصل الآن",
+        "UserStatusOffline": "غير متصل",
+        "UserStatusRecently": "آخر ظهور مؤخراً",
+        "UserStatusLastWeek": "آخر ظهور خلال أسبوع",
+        "UserStatusLastMonth": "آخر ظهور خلال شهر",
+        "UserStatusEmpty": "آخر ظهور مخفي",
+    }
+    status = status_map.get(status_name, "آخر ظهور غير متاح")
+    name = f"{getattr(target, 'first_name', '') or ''} {getattr(target, 'last_name', '') or ''}".strip() or "بدون اسم"
+    username = f"@{target.username}" if getattr(target, "username", None) else "ماعنده"
+    link = await build_direct_account_link(target)
+    creation = estimated_creation_year(target.id)
+    return (
+        "🔎 **كشف معلومات الحساب**\n\n"
+        f"• الاسم: {name}\n"
+        f"• الآيدي: `{target.id}`\n"
+        f"• اليوزر: {username}\n"
+        f"• رابط الحساب: [اضغط هنا]({link})\n"
+        f"• رقم الهاتف: `{phone_text}`\n"
+        f"• البايو: {about}\n"
+        f"• القروبات المشتركة: `{common_count}`\n"
+        f"• بينكم محادثة خاصة: {'نعم' if private_chat else 'لا'}\n"
+        f"• صور الحساب: `{photo_count}`\n"
+        f"• تاريخ الإنشاء التقديري: `{creation}`\n"
+        f"• حالة الحساب: {account_flags}\n"
+        f"• الظهور: {status}"
+    )
 
 
 async def get_account_chat_lists(client, mode="all"):
@@ -1603,6 +2537,67 @@ async def get_command_text(event, text, command):
     return ""
 
 
+TRANSLATION_COMMANDS = {
+    "عربي": ("ar", "العربية"),
+    "انجليزي": ("en", "الإنجليزية"),
+    "روسي": ("ru", "الروسية"),
+    "فرنسي": ("fr", "الفرنسية"),
+    "تركي": ("tr", "التركية"),
+    "هندي": ("hi", "الهندية"),
+    "الماني": ("de", "الألمانية"),
+    "كردي": ("ku", "الكردية"),
+    "فارسي": ("fa", "الفارسية"),
+}
+
+TRANSLATION_GUIDE = """⤾ اوامــر الـترجـمـة 🏧
+⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆
+
+• .عربي
+• .انجليزي
+• .روسي
+• .فرنسي
+• .تركي
+• .هندي
+• .الماني
+• .كردي
+• .فارسي
+
+•  الاستخـدام 💡
+↞ قـم بالـرد على الرساله بالامـر أو بكتابه النـص بعد الامـر"""
+
+
+def _translate_text_sync(text, target_language):
+    response = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": text, "langpair": f"autodetect|{target_language}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    translated = (payload.get("responseData") or {}).get("translatedText")
+    if not translated:
+        raise RuntimeError("خدمة الترجمة لم تُرجع نصاً قابلاً للعرض.")
+    return translated
+
+
+async def translate_text(text, target_language):
+    if not text or not text.strip():
+        raise ValueError("أرسل النص بعد الأمر أو رد على رسالة نصية.")
+    clean_text = text.strip()
+    cache_key = (clean_text, target_language)
+    now = time.monotonic()
+    cached = _translation_cache.get(cache_key)
+    if cached and now - cached[0] < 900:
+        return cached[1]
+    translated = await asyncio.to_thread(_translate_text_sync, clean_text, target_language)
+    _translation_cache[cache_key] = (now, translated)
+    if len(_translation_cache) > 300:
+        oldest = sorted(_translation_cache.items(), key=lambda item: item[1][0])[:80]
+        for key, _ in oldest:
+            _translation_cache.pop(key, None)
+    return translated
+
+
 async def make_handwriting_image(client, chat_id, value):
     if Image is None:
         raise RuntimeError("مكتبة Pillow غير مثبّتة. نفذ: pip install pillow")
@@ -1631,6 +2626,7 @@ async def start_broadcast_task(client, owner_id, source_message, limit):
 
     async def worker():
         delivered = 0
+        failed = 0
         try:
             me = await client.get_me()
             async for dialog in client.iter_dialogs(limit=None):
@@ -1643,11 +2639,19 @@ async def start_broadcast_task(client, owner_id, source_message, limit):
                         delivered += 1
                         await asyncio.sleep(0.8)
                     except Exception:
-                        pass
-            await client.send_message(owner_id, f"✅ انتهت الإذاعة. تم الإرسال إلى `{delivered}` محادثة خاصة.")
+                        failed += 1
+            total = delivered + failed
+            await client.send_message(
+                owner_id,
+                f"✅ **انتهت إذاعة قسم الحساب.**\n\n• تم الإرسال بنجاح: `{delivered}` شخصاً\n• فشل الإرسال: `{failed}` شخصاً\n• إجمالي من تمت معالجتهم: `{total}` شخصاً"
+            )
         except asyncio.CancelledError:
             try:
-                await client.send_message(owner_id, f"⏹️ تم إيقاف الإذاعة بعد الإرسال إلى `{delivered}` محادثة.")
+                total = delivered + failed
+                await client.send_message(
+                    owner_id,
+                    f"⏹️ **تم إيقاف إذاعة قسم الحساب.**\n\n• تم الإرسال قبل الإيقاف: `{delivered}` شخصاً\n• فشل الإرسال: `{failed}` شخصاً\n• إجمالي من تمت معالجتهم: `{total}` شخصاً"
+                )
             except Exception:
                 pass
             raise
@@ -1681,6 +2685,17 @@ async def bulk_account_action(client, owner_id, action):
     return count
 
 
+async def get_cached_user_me(client_inst, owner_id):
+    """يتجنب طلب get_me من تيليجرام مع كل أمر أو رسالة."""
+    cached = _user_me_cache.get(owner_id)
+    now = time.monotonic()
+    if cached and now - cached[0] < 900:
+        return cached[1]
+    me = await client_inst.get_me()
+    _user_me_cache[owner_id] = (now, me)
+    return me
+
+
 async def register_userbot_events(client_inst, owner_id):
     @client_inst.on(events.NewMessage)
     async def userbot_handler(event):
@@ -1690,11 +2705,34 @@ async def register_userbot_events(client_inst, owner_id):
 
         chat_id = event.chat_id
         text = event.raw_text.strip() if event.raw_text else ""
-        me = await client_inst.get_me()
+        me = await get_cached_user_me(client_inst, owner_id)
 
-        if event.sender_id == me.id:
+        # في القناة قد يكون مرسل المنشور هو آيدي القناة، لكن event.out يثبت أن المنشور من حساب المستخدم.
+        if event.out and (event.sender_id == me.id or event.is_channel):
             init_user_db(owner_id)
             user_info = users_db[owner_id]
+
+            # نتيجة أي أمر مكتوب بالرد تعود إلى الرسالة نفسها؛ من دون رد تبقى رسالة عادية.
+            command_reply_to = event.reply_to_msg_id
+
+            async def command_reply(message, **kwargs):
+                if command_reply_to and "reply_to" not in kwargs:
+                    kwargs["reply_to"] = command_reply_to
+                sent_message = await client_inst.send_message(chat_id, message, **kwargs)
+                # لا تحذف القوائم والأزرار أو رسائل التقدم حتى تبقى قابلة للاستخدام والتحديث.
+                message_text = str(message or "")
+                is_progress = message_text.startswith(("⏳", "🔍", "⚡", "📊"))
+                if not kwargs.get("buttons") and not is_progress:
+                    raw_command = (event.raw_text or "").lstrip(".").strip().split()
+                    action_commands = {"انتحال", "كشف", "ايدي", "رابط", "الانشاء", "تثبيت", "الغاء", "إلغاء", "كتم"}
+                    wait_seconds = 10 if command_reply_to or (raw_command and raw_command[0] in action_commands) else 4
+                    asyncio.create_task(delete_message_after(sent_message, wait_seconds))
+                return sent_message
+
+            async def command_reply_file(file, **kwargs):
+                if command_reply_to and "reply_to" not in kwargs:
+                    kwargs["reply_to"] = command_reply_to
+                return await client_inst.send_file(chat_id, file, **kwargs)
             
             # إدخالات الأوامر اليدوية التي تبدأ في محادثة معينة تبقى فيها.
             pending_local = user_states.get(owner_id)
@@ -1702,7 +2740,7 @@ async def register_userbot_events(client_inst, owner_id):
                 pending_step = pending_local.get("step")
                 if pending_step == "awaiting_welcome_text_local":
                     if not text:
-                        await client_inst.send_message(chat_id, "⚠️ أرسل نص الترحيب أولاً.")
+                        await command_reply( "⚠️ أرسل نص الترحيب أولاً.")
                         return
                     user_info["welcome_text"] = text
                     save_data()
@@ -1711,12 +2749,12 @@ async def register_userbot_events(client_inst, owner_id):
                         await event.delete()
                     except Exception:
                         pass
-                    await client_inst.send_message(chat_id, "✅ تم تعيين نص الترحيب بنجاح.")
+                    await command_reply( "✅ تم تعيين نص الترحيب بنجاح.")
                     return
 
                 if pending_step == "awaiting_welcome_photo_local":
                     if not event.photo:
-                        await client_inst.send_message(chat_id, "⚠️ أرسل **صورة** فقط لتعيينها كصورة ترحيب.")
+                        await command_reply( "⚠️ أرسل **صورة** فقط لتعيينها كصورة ترحيب.")
                         return
                     old_photo = user_info.get("welcome_photo")
                     _safe_remove(old_photo)
@@ -1729,7 +2767,7 @@ async def register_userbot_events(client_inst, owner_id):
                         await event.delete()
                     except Exception:
                         pass
-                    await client_inst.send_message(chat_id, "✅ تم تعيين صورة الترحيب بنجاح.")
+                    await command_reply( "✅ تم تعيين صورة الترحيب بنجاح.")
                     return
 
             t_start = user_info.get("tastir_start_cmds", [])
@@ -1747,7 +2785,7 @@ async def register_userbot_events(client_inst, owner_id):
             # يوضع هذا الشرط قبل الأوامر القديمة حتى لا يتعارض مع أي أمر تشغيل مخصص باسم «التسطير».
             if text == ".التسطير":
                 if not is_subscribed(owner_id):
-                    await client_inst.send_message(chat_id, "⚠️ هذه القائمة خاصة بالمشتركين في التسطير. فعّل كود اشتراك التسطير أولاً.")
+                    await command_reply( "⚠️ هذه القائمة خاصة بالمشتركين في التسطير. فعّل كود اشتراك التسطير أولاً.")
                     return
                 try:
                     await event.delete()
@@ -1788,7 +2826,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "tastir", legacy_target_msg_id, legacy_target_user_id)
                 if not started:
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
+                    await command_reply( "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
                 return
 
             if legacy_text in f_start:
@@ -1799,7 +2837,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "fardiyyat", legacy_target_msg_id, legacy_target_user_id)
                 if not started:
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
+                    await command_reply( "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
                 return
 
             if legacy_text in r_start:
@@ -1809,10 +2847,10 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                 if not legacy_target_user_id or legacy_target_user_id in manager_bot_id:
-                    await client_inst.send_message(chat_id, "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
+                    await command_reply( "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
                     return
                 if not (user_info.get("reply", []) or default_reply or user_info.get("tastir", []) or default_tastir or user_info.get("fardiyyat", []) or default_fardiyyat):
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
+                    await command_reply( "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
                     return
                 task_key = (owner_id, chat_id, legacy_target_user_id, "reply")
                 running_tasks[task_key] = {"task": None, "owner_id": owner_id, "chat_id": chat_id, "target_user_id": legacy_target_user_id, "mode": "reply", "target_msg_id": legacy_target_msg_id}
@@ -1876,16 +2914,38 @@ async def register_userbot_events(client_inst, owner_id):
             cmd_parts = text.split()
             cmd_first_word = cmd_parts[0] if cmd_parts else ""
 
+            # ===== تفعيل تلقائي آمن: الكود يفعّل فقط عندما يرسله صاحب الحساب من حسابه =====
+            if len(cmd_parts) == 1 and re.fullmatch(r"(?:PBL|SRC|ALL)-[A-Za-z0-9_-]+", text, flags=re.IGNORECASE):
+                code = text.upper()
+                kind, days = await apply_any_activation_code(owner_id, code, event)
+                if kind:
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                    result_text = {
+                        "tastir": f"✅ تم تفعيل اشتراك التسطير تلقائياً لمدة {days} يوم.",
+                        "source": f"✅ تم تفعيل مميزات السورس تلقائياً لمدة {days} يوم.",
+                        "all": f"✅ تم تفعيل جميع الصلاحيات تلقائياً لمدة {days} يوم. تم تفعيل التسطير ومميزات السورس معاً.",
+                    }[kind]
+                    await command_reply( result_text)
+                return
+
             # ===== أوامر مميزات السورس الجديدة =====
             if text == "الاوامر":
-                if not is_source_subscribed(owner_id):
-                    await client_inst.send_message(chat_id, source_lock_message())
+                # كل حساب مرتبط ومشترك يعرض قائمته بنفسه؛ لا توجد أي صلاحية خاصة بالمطور هنا.
+                if not has_any_subscription(owner_id):
+                    await command_reply( source_lock_message())
                     return
                 try:
                     await event.delete()
                 except Exception:
                     pass
-                await send_source_commands_menu(client_inst, owner_id, chat_id)
+                if is_source_subscribed(owner_id):
+                    await send_source_commands_menu(client_inst, owner_id, chat_id)
+                else:
+                    # مشترك التسطير فقط يحصل على قائمة التسطير بدلاً من قائمة السورس المقفلة.
+                    await send_tastir_commands_menu(client_inst, owner_id, chat_id)
                 return
 
             if text == "انتحال" or text.startswith("انتحال "):
@@ -1894,18 +2954,19 @@ async def register_userbot_events(client_inst, owner_id):
                 try:
                     target_id = await resolve_target_user(event)
                     if not target_id:
-                        await client_inst.send_message(chat_id, "❌ استخدم الأمر بالرد على شخص أو اكتب: `.انتحال @username`")
+                        await command_reply( "❌ استخدم الأمر بالرد على شخص أو اكتب: `.انتحال @username`")
                         return
                     target = await client_inst.get_entity(target_id)
                     if not getattr(target, "first_name", None):
-                        await client_inst.send_message(chat_id, "❌ هذا الهدف ليس حساب مستخدم.")
+                        await command_reply( "❌ هذا الهدف ليس حساب مستخدم.")
                         return
                     await event.delete()
-                    status = await client_inst.send_message(chat_id, "⏳ جاري تطبيق بيانات المظهر...")
+                    status = await command_reply( "⏳ جاري تطبيق بيانات المظهر...")
                     target_name = await apply_profile_template(client_inst, owner_id, target)
-                    await status.edit(f"✅ تم تطبيق الاسم والبايو والصورة المتاحة لحساب: **{target_name}**\n↩️ اكتب `.اعاده` لإرجاع النسخة المحفوظة.")
+                    await status.edit("✅ **تم الانتحال بنجاح.**\n↩️ اكتب `.اعاده` لإرجاع النسخة المحفوظة.")
+                    asyncio.create_task(delete_message_after(status, 10))
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر تطبيق بيانات المظهر:\n`{e}`")
+                    await command_reply( f"❌ تعذر تطبيق بيانات المظهر:\n`{e}`")
                 return
 
             if text == "اعاده":
@@ -1915,10 +2976,11 @@ async def register_userbot_events(client_inst, owner_id):
                     await event.delete()
                 except Exception:
                     pass
-                status = await client_inst.send_message(chat_id, "⏳ جاري إعادة بيانات حسابك المحفوظة...")
+                status = await command_reply( "⏳ جاري إعادة بيانات حسابك المحفوظة...")
                 try:
                     await restore_profile_template(client_inst, owner_id)
-                    await status.edit("✅ تمت إعادة الاسم والبايو والصورة المحفوظة لحسابك.")
+                    await status.edit("✅ تمت إعادة بيانات حسابك المحفوظة.")
+                    asyncio.create_task(delete_message_after(status, 4))
                 except Exception as e:
                     await status.edit(f"❌ تعذرت الإعادة:\n`{e}`")
                 return
@@ -1929,7 +2991,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["welcome_enabled"] = True
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تفعيل الترحيب الخاص.")
+                await command_reply( "✅ تم تفعيل الترحيب الخاص.")
                 return
 
             if text == "تعطيل الترحيب":
@@ -1938,7 +3000,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["welcome_enabled"] = False
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تعطيل الترحيب الخاص.")
+                await command_reply( "✅ تم تعطيل الترحيب الخاص.")
                 return
 
             if text == "تعيين الترحيب":
@@ -1949,7 +3011,7 @@ async def register_userbot_events(client_inst, owner_id):
                 except Exception:
                     pass
                 user_states[owner_id] = {"step": "awaiting_welcome_text_local", "origin_chat_id": chat_id}
-                await client_inst.send_message(chat_id, "📝 أرسل نص الترحيب الجديد الآن في **نفس هذه المحادثة**:")
+                await command_reply( "📝 أرسل نص الترحيب الجديد الآن في **نفس هذه المحادثة**:")
                 return
 
             if text == "تعيين صورة الترحيب":
@@ -1960,7 +3022,7 @@ async def register_userbot_events(client_inst, owner_id):
                 except Exception:
                     pass
                 user_states[owner_id] = {"step": "awaiting_welcome_photo_local", "origin_chat_id": chat_id}
-                await client_inst.send_message(chat_id, "🖼️ أرسل صورة الترحيب الجديدة الآن في **نفس هذه المحادثة**:")
+                await command_reply( "🖼️ أرسل صورة الترحيب الجديدة الآن في **نفس هذه المحادثة**:")
                 return
 
             if text == "حذف صورة الترحيب":
@@ -1970,7 +3032,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["welcome_photo"] = None
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم حذف صورة الترحيب.")
+                await command_reply( "✅ تم حذف صورة الترحيب.")
                 return
 
             if text == "جلب الترحيب":
@@ -1981,10 +3043,10 @@ async def register_userbot_events(client_inst, owner_id):
                 except Exception:
                     pass
                 current_welcome = user_info.get("welcome_text", "أهلاً بك، نورت الخاص.")
-                await client_inst.send_message(chat_id, f"📋 **نص الترحيب الحالي:**\n\n{current_welcome}")
+                await command_reply( f"📋 **نص الترحيب الحالي:**\n\n{current_welcome}")
                 photo_path = user_info.get("welcome_photo")
                 if photo_path and os.path.exists(photo_path):
-                    await client_inst.send_file(chat_id, photo_path)
+                    await command_reply_file( photo_path)
                 return
 
             if text == "تفعيل الردود":
@@ -1993,7 +3055,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["smart_replies_enabled"] = True
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تفعيل ردود موجود.")
+                await command_reply( "✅ تم تفعيل ردود موجود.")
                 return
 
             if text == "تعطيل الردود":
@@ -2002,14 +3064,14 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["smart_replies_enabled"] = False
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تعطيل ردود موجود.")
+                await command_reply( "✅ تم تعطيل ردود موجود.")
                 return
 
             if cmd_first_word in ["نشر", "واو", "ستارت"]:
                 if not is_source_subscribed(owner_id):
                     return
                 if not event.reply_to_msg_id:
-                    await client_inst.send_message(chat_id, "❌ يجب الرد على الرسالة المراد نشرها ثم كتابة الأمر.")
+                    await command_reply( "❌ يجب الرد على الرسالة المراد نشرها ثم كتابة الأمر.")
                     return
                 try:
                     forward_mode = cmd_parts[-1] == "تحويل"
@@ -2028,19 +3090,25 @@ async def register_userbot_events(client_inst, owner_id):
                         target_chat_id = int(clean_parts[3])
                     if delay < 0.5 or count < 1:
                         raise ValueError("أقل مدة مسموحة 0.5 ثانية والعدد يجب أن يكون أكبر من صفر.")
-                    allowed, target_name, permission_reason = await check_publish_permission(client_inst, target_chat_id, owner_id)
-                    if not allowed:
-                        await client_inst.send_message(chat_id, f"❌ لم يبدأ النشر في {target_name}.\n• السبب ← {permission_reason}")
-                        return
+                    # لا نمنع البدء بفحص مبدئي قد يخلط بين اشتراك إجباري وتقييد فعلي.
+                    # المهمة تجرب الإرسال أولاً، ثم تعالج الأزرار والروابط إن ظهر منع كتابة.
+                    target_name = await _publish_target_name(client_inst, target_chat_id)
+                    pending_targets = []
                     if count == 999:
                         count = 10**9
                     reply_message = await event.get_reply_message()
                     await event.delete()
-                    await start_auto_publish_task(client_inst, owner_id, target_chat_id, reply_message, delay, count, forward_mode)
+                    await start_auto_publish_task(
+                        client_inst, owner_id, target_chat_id, reply_message, delay, count, forward_mode,
+                        origin_chat_id=chat_id, pending_approval_targets=pending_targets
+                    )
                     mode_text = "بتحويل الرسالة" if forward_mode else "بدون تحويل المصدر"
-                    await client_inst.send_message(chat_id, f"✅ بدأ النشر في `{target_chat_id}` كل `{delay}` ثانية ({mode_text}).")
+                    if pending_targets:
+                        await command_reply( "⏳ تم إرسال طلب انضمام للاشتراك الإجباري. ستنتظر المهمة موافقة الأدمن ثم تكمل النشر تلقائياً.")
+                    else:
+                        await command_reply( f"✅ بدأ النشر في **{target_name}** كل `{delay}` ثانية ({mode_text}).")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر بدء النشر:\n`{e}`")
+                    await command_reply( f"❌ تعذر بدء النشر:\n`{e}`")
                 return
 
             if text == "النشر الشغال":
@@ -2050,8 +3118,13 @@ async def register_userbot_events(client_inst, owner_id):
                     await event.delete()
                 except Exception:
                     pass
-                jobs = [key for key, task in auto_publish_tasks.items() if key[0] == owner_id and not task.done()]
-                await client_inst.send_message(chat_id, "📊 **عمليات النشر الشغالة:**\n\n" + ("\n".join(f"• `{key[1]}`" for key in jobs) if jobs else "لا توجد عمليات نشر."))
+                jobs = [job for job in users_db.get(owner_id, {}).get("auto_publish_jobs", []) if (owner_id, int(job.get("target_chat_id", 0))) in auto_publish_tasks]
+                rows = []
+                for job in jobs:
+                    target_id = int(job.get("target_chat_id", 0))
+                    target_name = await _publish_target_name(client_inst, target_id)
+                    rows.append(f"• **{target_name}** — `{target_id}`\n  تم إرسال: `{job.get('completed', 0)}` من `{job.get('count', 0)}`")
+                await command_reply( "📊 **عمليات النشر الشغالة:**\n\n" + ("\n".join(rows) if rows else "لا توجد عمليات نشر."))
                 return
 
             if text == "بس":
@@ -2059,7 +3132,7 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 stopped = await stop_auto_publish_task(client_inst, owner_id, chat_id, "تم إيقاف النشر يدوياً بواسطة صاحب الحساب")
                 await event.delete()
-                await client_inst.send_message(chat_id, f"✅ تم إيقاف {stopped} عملية نشر في هذا القروب.")
+                await command_reply( f"✅ تم إيقاف {stopped} عملية نشر في هذا القروب.")
                 return
 
             if text == "ايقاف النشر":
@@ -2067,14 +3140,14 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 stopped = await stop_auto_publish_task(client_inst, owner_id, reason="تم إيقاف جميع عمليات النشر يدوياً بواسطة صاحب الحساب")
                 await event.delete()
-                await client_inst.send_message(chat_id, f"✅ تم إيقاف {stopped} عملية نشر.")
+                await command_reply( f"✅ تم إيقاف {stopped} عملية نشر.")
                 return
 
             if text in ["لصوره", "لملصق", "الصوت", "لبصمه"]:
                 if not is_source_subscribed(owner_id):
                     return
                 if not event.reply_to_msg_id:
-                    await client_inst.send_message(chat_id, "❌ يجب الرد على الوسيط المطلوب تحويله أولاً.")
+                    await command_reply( "❌ يجب الرد على الوسيط المطلوب تحويله أولاً.")
                     return
                 try:
                     reply_message = await event.get_reply_message()
@@ -2088,7 +3161,7 @@ async def register_userbot_events(client_inst, owner_id):
                     else:
                         await convert_to_voice_note(client_inst, reply_message, chat_id)
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر التحويل:\n`{e}`")
+                    await command_reply( f"❌ تعذر التحويل:\n`{e}`")
                 return
 
             if text == "ايدي" or text.startswith("ايدي "):
@@ -2101,13 +3174,18 @@ async def register_userbot_events(client_inst, owner_id):
                         target_id = reply_message.sender_id if reply_message else None
                     elif len(cmd_parts) > 1:
                         target_id = (await client_inst.get_entity(cmd_parts[1])).id
+                    elif event.is_private:
+                        private_target = await event.get_chat()
+                        await event.delete()
+                        await command_reply( f"`{getattr(private_target, 'id', chat_id)}`")
+                        return
                     target = await client_inst.get_entity(target_id or me.id)
                     full_name = f"{getattr(target, 'first_name', '') or ''} {getattr(target, 'last_name', '') or ''}".strip() or "بدون اسم"
                     username = f"@{target.username}" if getattr(target, "username", None) else "ماعنده"
                     await event.delete()
-                    await client_inst.send_message(chat_id, f"💳 **بيانات المستخدم:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• اليوزر: {username}")
+                    await command_reply( f"💳 **بيانات المستخدم:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• اليوزر: {username}")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر جلب البيانات:\n`{e}`")
+                    await command_reply( f"❌ تعذر جلب البيانات:\n`{e}`")
                 return
 
             if text == "بياناتي":
@@ -2116,9 +3194,9 @@ async def register_userbot_events(client_inst, owner_id):
                 try:
                     await event.delete()
                     report = await get_my_data_report(client_inst, owner_id)
-                    await client_inst.send_message(chat_id, report)
+                    await command_reply( report)
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر جلب بياناتك:\n`{e}`")
+                    await command_reply( f"❌ تعذر جلب بياناتك:\n`{e}`")
                 return
 
             if text == "رابط" or text.startswith("رابط "):
@@ -2129,9 +3207,9 @@ async def register_userbot_events(client_inst, owner_id):
                     full_name = f"{getattr(target, 'first_name', '') or ''} {getattr(target, 'last_name', '') or ''}".strip() or "بدون اسم"
                     link = await build_direct_account_link(target)
                     await event.delete()
-                    await client_inst.send_message(chat_id, f"🔗 **رابط الحساب:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• الرابط: [اضغط هنا]({link})")
+                    await command_reply( f"🔗 **رابط الحساب:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• الرابط: [اضغط هنا]({link})")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر جلب رابط الحساب:\n`{e}`")
+                    await command_reply( f"❌ تعذر جلب رابط الحساب:\n`{e}`")
                 return
 
             if text == "الانشاء" or text.startswith("الانشاء "):
@@ -2142,9 +3220,43 @@ async def register_userbot_events(client_inst, owner_id):
                     full_name = f"{getattr(target, 'first_name', '') or ''} {getattr(target, 'last_name', '') or ''}".strip() or "بدون اسم"
                     estimated = estimated_creation_year(target.id)
                     await event.delete()
-                    await client_inst.send_message(chat_id, f"📆 **تاريخ الإنشاء التقديري:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• تقدير الإنشاء: `{estimated}`\n\n⚠️ هذا تقدير مبني على نطاق الآيدي وليس تاريخاً رسمياً من تيليجرام.")
+                    await command_reply( f"📆 **تاريخ الإنشاء التقديري:**\n\n• الاسم: {full_name}\n• الآيدي: `{target.id}`\n• تقدير الإنشاء: `{estimated}`\n\n⚠️ هذا تقدير مبني على نطاق الآيدي وليس تاريخاً رسمياً من تيليجرام.")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر كشف تاريخ الإنشاء:\n`{e}`")
+                    await command_reply( f"❌ تعذر كشف تاريخ الإنشاء:\n`{e}`")
+                return
+
+            if text == "كشف" or text.startswith("كشف "):
+                if not is_source_subscribed(owner_id):
+                    return
+                try:
+                    target = await get_user_entity_from_command(client_inst, event, cmd_parts, private_peer=True)
+                    report = await build_account_inspection_report(client_inst, target)
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                    await command_reply( report, link_preview=False)
+                except Exception as e:
+                    await command_reply( f"❌ تعذر كشف معلومات الحساب:\n`{e}`")
+                return
+
+            if cmd_first_word in TRANSLATION_COMMANDS:
+                if not is_source_subscribed(owner_id):
+                    return
+                target_language, _ = TRANSLATION_COMMANDS[cmd_first_word]
+                try:
+                    source_value = await get_command_text(event, text, cmd_first_word)
+                    if not source_value:
+                        return
+                    translated_value = await translate_text(source_value, target_language)
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                    # النتيجة فقط، من دون عنوان أو توجيهات أو رسائل خطأ ظاهرة للمستخدم.
+                    await command_reply( translated_value)
+                except Exception:
+                    pass
                 return
 
             if text == "تفعيل الذاتيه":
@@ -2153,7 +3265,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["self_save_enabled"] = True
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تفعيل حفظ الذاتية التلقائي.")
+                await command_reply( "✅ تم تفعيل حفظ الذاتية التلقائي.")
                 return
 
             if text == "تعطيل الذاتيه":
@@ -2162,7 +3274,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["self_save_enabled"] = False
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم تعطيل حفظ الذاتية التلقائي.")
+                await command_reply( "✅ تم تعطيل حفظ الذاتية التلقائي.")
                 return
 
             if text.startswith("تعيين مجموعة الذاتيه"):
@@ -2176,9 +3288,9 @@ async def register_userbot_events(client_inst, owner_id):
                     user_info["self_save_chat_id"] = target_chat.id
                     save_data()
                     await event.delete()
-                    await client_inst.send_message(chat_id, f"✅ تم تعيين مجموعة الذاتية: `{target_chat.id}`")
+                    await command_reply( f"✅ تم تعيين مجموعة الذاتية: `{target_chat.id}`")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر تعيين مجموعة الذاتية:\n`{e}`")
+                    await command_reply( f"❌ تعذر تعيين مجموعة الذاتية:\n`{e}`")
                 return
 
             if text == "حذف مجموعة الذاتيه":
@@ -2187,14 +3299,14 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["self_save_chat_id"] = None
                 save_data()
                 await event.delete()
-                await client_inst.send_message(chat_id, "✅ تم حذف مجموعة الذاتية، وسيتم الحفظ في الرسائل المحفوظة.")
+                await command_reply( "✅ تم حذف مجموعة الذاتية، وسيتم الحفظ في الرسائل المحفوظة.")
                 return
 
             if text == "ذاتيه":
                 if not is_source_subscribed(owner_id):
                     return
                 if not event.reply_to_msg_id:
-                    await client_inst.send_message(chat_id, "❌ قم بالرد على الوسيط الذي تريد حفظه ثم اكتب `.ذاتيه`.")
+                    await command_reply( "❌ قم بالرد على الوسيط الذي تريد حفظه ثم اكتب `.ذاتيه`.")
                     return
                 try:
                     reply_message = await event.get_reply_message()
@@ -2202,9 +3314,9 @@ async def register_userbot_events(client_inst, owner_id):
                         raise ValueError("الرسالة التي تم الرد عليها لا تحتوي على وسيط.")
                     await event.delete()
                     target = await save_media_to_self_destination(client_inst, owner_id, reply_message)
-                    await client_inst.send_message(chat_id, f"✅ تم حفظ الوسيط في `{target}`.")
+                    await command_reply( f"✅ تم حفظ الوسيط في `{target}`.")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر حفظ الوسيط:\n`{e}`")
+                    await command_reply( f"❌ تعذر حفظ الوسيط:\n`{e}`")
                 return
 
             if text in ["قروباتي مالك", "قروباتي ادمن", "قروباتي الكل", "قنواتي مالك", "قنواتي ادمن", "قنواتي الكل"]:
@@ -2224,9 +3336,9 @@ async def register_userbot_events(client_inst, owner_id):
                     output += "\n".join(f"• {name} — `{chat_id}`" for name, chat_id in items[:100]) if items else "لا توجد نتائج."
                     if len(items) > 100:
                         output += f"\n\n⚠️ تم عرض 100 من أصل {len(items)}."
-                    await client_inst.send_message(chat_id, output)
+                    await command_reply( output)
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر جلب القائمة:\n`{e}`")
+                    await command_reply( f"❌ تعذر جلب القائمة:\n`{e}`")
                 return
 
             if text == "احصائياتي":
@@ -2234,13 +3346,13 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 try:
                     await event.delete()
-                    await client_inst.send_message(chat_id, await build_stats_report(client_inst))
+                    await command_reply( await build_stats_report(client_inst))
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر جلب الإحصائيات:\n`{e}`")
+                    await command_reply( f"❌ تعذر جلب الإحصائيات:\n`{e}`")
                 return
 
             # ===== أوامر البحث والتحميل =====
-            if text == "ح":
+            if text in ("الحاسبه", "الحاسبة", "ح"):
                 if not is_source_subscribed(owner_id):
                     return
                 try:
@@ -2252,7 +3364,7 @@ async def register_userbot_events(client_inst, owner_id):
                     results = await client_inst.inline_query(bot_me.username, "demon_calculator")
                     await results[0].click(chat_id)
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر عرض الآلة الحاسبة:\n`{e}`")
+                    await command_reply( f"❌ تعذر عرض الآلة الحاسبة:\n`{e}`")
                 return
 
             if text.startswith("يوت "):
@@ -2262,12 +3374,12 @@ async def register_userbot_events(client_inst, owner_id):
                 if not query:
                     return
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري البحث وتحميل الصوت...")
+                status = await command_reply( "⏳ جاري البحث وتحميل الصوت...")
                 try:
                     search_url = f"ytsearch1:{query}"
                     media_path, info = await _ytdlp_download(search_url, audio_only=True)
                     try:
-                        await client_inst.send_file(chat_id, media_path, caption=(info.get("title") or query)[:900])
+                        await command_reply_file( media_path, caption=(info.get("title") or query)[:900])
                     finally:
                         _safe_remove(media_path)
                     await status.delete()
@@ -2282,7 +3394,7 @@ async def register_userbot_events(client_inst, owner_id):
                 if not url:
                     return
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري التحميل...")
+                status = await command_reply( "⏳ جاري التحميل...")
                 try:
                     await download_and_send_url(client_inst, chat_id, url, audio_only=False)
                     await status.delete()
@@ -2296,7 +3408,7 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 url = text[8:].strip()
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري تحميل محتوى بنترست...")
+                status = await command_reply( "⏳ جاري تحميل محتوى بنترست...")
                 try:
                     await download_and_send_url(client_inst, chat_id, url)
                     await status.delete()
@@ -2310,7 +3422,7 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 url = text[7:].strip()
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري تحميل الستوري...")
+                status = await command_reply( "⏳ جاري تحميل الستوري...")
                 try:
                     await download_telegram_story(client_inst, chat_id, url)
                     await status.delete()
@@ -2324,7 +3436,7 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 url = text[8:].strip()
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري تحميل المستودع...")
+                status = await command_reply( "⏳ جاري تحميل المستودع...")
                 try:
                     await download_github_repository(client_inst, chat_id, url)
                     await status.delete()
@@ -2338,7 +3450,7 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 url = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري حفظ المحتوى...")
+                status = await command_reply( "⏳ جاري حفظ المحتوى...")
                 try:
                     await save_restricted_message(client_inst, chat_id, url)
                     await status.delete()
@@ -2352,13 +3464,13 @@ async def register_userbot_events(client_inst, owner_id):
                     return
                 value = await get_command_text(event, text, "اكتب")
                 if not value:
-                    await client_inst.send_message(chat_id, "❌ اكتب النص بعد الأمر: `.اكتب النص`")
+                    await command_reply( "❌ اكتب النص بعد الأمر: `.اكتب النص`")
                     return
                 await event.delete()
                 try:
                     await make_handwriting_image(client_inst, chat_id, value)
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر إنشاء الكتابة:\n`{e}`")
+                    await command_reply( f"❌ تعذر إنشاء الكتابة:\n`{e}`")
                 return
 
             if text == "نسخ" or text.startswith("نسخ ") or text == "غامق" or text.startswith("غامق ") or text == "مائل" or text.startswith("مائل "):
@@ -2367,15 +3479,15 @@ async def register_userbot_events(client_inst, owner_id):
                 command = cmd_first_word
                 value = await get_command_text(event, text, command)
                 if not value:
-                    await client_inst.send_message(chat_id, "❌ اكتب النص بعد الأمر أو رد على رسالة نصية.")
+                    await command_reply( "❌ اكتب النص بعد الأمر أو رد على رسالة نصية.")
                     return
                 await event.delete()
                 if command == "نسخ":
-                    await client_inst.send_message(chat_id, f"`{value}`")
+                    await command_reply( f"`{value}`")
                 elif command == "غامق":
-                    await client_inst.send_message(chat_id, f"**{value}**")
+                    await command_reply( f"**{value}**")
                 else:
-                    await client_inst.send_message(chat_id, f"__{value}__")
+                    await command_reply( f"__{value}__")
                 return
 
             # ===== الإذاعة والتنظيف =====
@@ -2383,7 +3495,7 @@ async def register_userbot_events(client_inst, owner_id):
                 if not is_source_subscribed(owner_id):
                     return
                 if not event.reply_to_msg_id:
-                    await client_inst.send_message(chat_id, "❌ قم بالرد على الرسالة المراد إذاعتها أولاً.")
+                    await command_reply( "❌ قم بالرد على الرسالة المراد إذاعتها أولاً.")
                     return
                 try:
                     parts = text.split()
@@ -2393,9 +3505,9 @@ async def register_userbot_events(client_inst, owner_id):
                     reply_message = await event.get_reply_message()
                     await event.delete()
                     await start_broadcast_task(client_inst, owner_id, reply_message, limit)
-                    await client_inst.send_message(chat_id, f"✅ بدأت الإذاعة إلى حد أقصى `{limit if limit < 10**9 else 'كل الخاص'}` محادثة.")
+                    await command_reply( f"✅ بدأت الإذاعة إلى حد أقصى `{limit if limit < 10**9 else 'كل الخاص'}` محادثة.")
                 except Exception as e:
-                    await client_inst.send_message(chat_id, f"❌ تعذر بدء الإذاعة:\n`{e}`")
+                    await command_reply( f"❌ تعذر بدء الإذاعة:\n`{e}`")
                 return
 
             if text == "ايقاف الاذاعه":
@@ -2403,9 +3515,9 @@ async def register_userbot_events(client_inst, owner_id):
                 if task and not task.done():
                     task.cancel()
                     await event.delete()
-                    await client_inst.send_message(chat_id, "⏹️ تم طلب إيقاف الإذاعة.")
+                    await command_reply( "⏹️ تم طلب إيقاف الإذاعة.")
                 else:
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد إذاعة شغالة حالياً.")
+                    await command_reply( "⚠️ لا توجد إذاعة شغالة حالياً.")
                 return
 
             if text in ["مغادرة القنوات", "مغادرة القروبات", "تصفية الخاص", "تصفية البوتات"]:
@@ -2418,7 +3530,7 @@ async def register_userbot_events(client_inst, owner_id):
                     "تصفية البوتات": "clear_bots"
                 }
                 await event.delete()
-                status = await client_inst.send_message(chat_id, "⏳ جاري تنفيذ العملية...")
+                status = await command_reply( "⏳ جاري تنفيذ العملية...")
                 try:
                     completed = await bulk_account_action(client_inst, owner_id, action_map[text])
                     await status.edit(f"✅ اكتملت العملية. تم التعامل مع `{completed}` محادثة/قناة/قروب.")
@@ -2426,58 +3538,40 @@ async def register_userbot_events(client_inst, owner_id):
                     await status.edit(f"❌ تعذر تنفيذ العملية:\n`{e}`")
                 return
 
-            if text == "تفليش" or text.startswith("تفليش "):
+            if text == "ايقاف التفليش":
                 if not is_source_subscribed(owner_id):
                     return
+                target_id = chat_id
+                if len(cmd_parts) > 2:
+                    try:
+                        target_id = int(cmd_parts[2])
+                    except ValueError:
+                        target_id = chat_id
+                stopped = await stop_manual_flush_tasks(owner_id, target_id)
                 try:
                     await event.delete()
                 except Exception:
                     pass
-                
-                has_ban = await check_user_ban_permissions(client_inst, chat_id, me)
-                if not has_ban:
-                    try:
-                        await client_inst.send_message(chat_id, "❌ انت لست مرفوع بصلاحية حظر المستخدمين بالقروب/القناه")
-                    except Exception:
-                        pass
-                    return
-                
-                # Fast flush process inline
-                status_msg = await client_inst.send_message(chat_id, "⏳ جاري بدء تفليش وطرد جميع الأعضاء من القناة/المجموعة...")
-                count = 0
-                error_occurred = False
-                err_msg = ""
-                try:
-                    chat_entity = await client_inst.get_entity(chat_id)
-                    async for member in client_inst.iter_participants(chat_entity):
-                        user = member
-                        if user.id == me.id:
-                            continue
-                        try:
-                            await client_inst(EditBannedRequest(chat_entity, user.id, ChatBannedRights(until_date=None, view_messages=True)))
-                            count += 1
-                            await asyncio.sleep(0.5)
-                        except Exception as e:
-                            err_str = str(e)
-                            if "FLOOD_WAIT" in err_str:
-                                match = re.search(r"\d+", err_str)
-                                wait_time = int(match.group()) if match else 5
-                                await status_msg.edit(f"⚠️ تم اكتشاف حظر مؤقت من تيليجرام. جارٍ الانتظار لمدة {wait_time} ثانية...")
-                                await asyncio.sleep(wait_time)
-                                continue
-                            elif "USER_ADMIN_INVALID" in err_str or "CHAT_ADMIN_REQUIRED" in err_str or "RIGHTS_NOT_AVAILABLE" in err_str:
-                                error_occurred = True
-                                err_msg = "انسحبت صلاحية الحظر أو حدث خطأ في الصلاحيات."
-                                break
-                            else:
-                                pass
+                if not stopped:
+                    await command_reply( "⚠️ لا توجد عملية تفليش يدوية شغالة لهذا القروب.")
+                return
 
-                    if error_occurred:
-                        await status_msg.edit(f"⚠️ **توقف التفليش:** {err_msg}\n📊 **الإحصائيات النهائية:** تم طرد {count} عضواً قبل توقف الصلاحية.")
-                    else:
-                        await status_msg.edit(f"✅ تمت التصفية بنجاح!\n📊 **إحصائيات التفليش:** تم طرد {count} عضواً من القناة/المجموعة.")
+            if text == "تفليش" or text.startswith("تفليش بالطرد") or text.startswith("تفليش بالحظر"):
+                if not is_source_subscribed(owner_id):
+                    return
+                mode = "kick" if text.startswith("تفليش بالطرد") else "ban"
+                target_ref = chat_id
+                parts = text.split(maxsplit=2)
+                if len(parts) == 3:
+                    target_ref = parts[2]
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                try:
+                    await start_manual_flush_task(client_inst, owner_id, target_ref, chat_id, mode)
                 except Exception as e:
-                    await status_msg.edit(f"❌ حدث خطأ أثناء التفليش: {e}\n📊 **الاحصائيات:** تم طرد {count} عضواً.")
+                    await command_reply( f"❌ تعذر بدء التفليش: `{e}`")
                 return
 
             if text.startswith("بحث "):
@@ -2490,7 +3584,7 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                     
-                    search_msg = await client_inst.send_message(chat_id, f"🔍 جاري البحث في يوتيوب عن: `{query}`...")
+                    search_msg = await command_reply( f"🔍 جاري البحث في يوتيوب عن: `{query}`...")
                     try:
                         file_path, title, duration, uploader, thumb_path = await search_and_download_youtube(query)
                         if file_path and os.path.exists(file_path):
@@ -2541,18 +3635,33 @@ async def register_userbot_events(client_inst, owner_id):
                             print(f"Error sending voice: {e}")
                 return
 
-            if text in ["تثبيت", "تثبيت الرسالة"]:
+            if text == "تثبيت":
                 if not is_source_subscribed(owner_id):
                     return
                 try:
                     await event.delete()
                 except Exception:
                     pass
-                if event.reply_to_msg_id:
-                    try:
-                        await client_inst.pin_message(chat_id, event.reply_to_msg_id, notify=True)
-                    except Exception:
-                        pass
+                if not event.reply_to_msg_id:
+                    await command_reply( "❌ رد على الرسالة المطلوبة ثم اكتب `.تثبيت`.")
+                    return
+                try:
+                    await client_inst.pin_message(chat_id, event.reply_to_msg_id, notify=True)
+                except Exception as e:
+                    await command_reply( f"❌ تعذر تثبيت الرسالة: `{e}`")
+                return
+
+            if text in ("الغاء التثبيت", "إلغاء التثبيت"):
+                if not is_source_subscribed(owner_id):
+                    return
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                try:
+                    await client_inst.unpin_message(chat_id, event.reply_to_msg_id if event.reply_to_msg_id else None, notify=True)
+                except Exception as e:
+                    await command_reply( f"❌ تعذر إلغاء التثبيت: `{e}`")
                 return
 
             if text in p_all_cmds or cmd_first_word in p_all_cmds:
@@ -2659,7 +3768,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "tastir", target_msg_id, target_user_id)
                 if not started:
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
+                    await command_reply( "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
                 return
 
             elif text in f_start:
@@ -2670,7 +3779,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "fardiyyat", target_msg_id, target_user_id)
                 if not started:
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
+                    await command_reply( "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
                 return
 
             elif text in r_start:
@@ -2680,10 +3789,10 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                 if not target_user_id or target_user_id in manager_bot_id:
-                    await client_inst.send_message(chat_id, "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
+                    await command_reply( "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
                     return
                 if not (user_info.get("reply", []) or default_reply or user_info.get("tastir", []) or default_tastir or user_info.get("fardiyyat", []) or default_fardiyyat):
-                    await client_inst.send_message(chat_id, "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
+                    await command_reply( "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
                     return
                 task_key = (owner_id, chat_id, target_user_id, "reply")
                 running_tasks[task_key] = {
@@ -2772,67 +3881,96 @@ async def register_userbot_events(client_inst, owner_id):
                 except Exception as e:
                     print(f"Self-save error: {e}")
 
-            # --- ميزة مجموعة التخزين: تنبيهات المنشن والرسائل الخاصة ---
+            # --- مجموعة التخزين: بطاقة واحدة للمصدر الحالي، ثم تحويل الرسائل حتى يصل مصدر مختلف ---
             if is_source_subscribed(owner_id) and user_info.get("storage_groups"):
                 storage_group_id = user_info["storage_groups"][-1]
-                is_mention = bool(event.mentioned)
                 is_private_msg = event.is_private and sender_id != me.id and sender_id not in manager_bot_id
+                is_reply_to_me = False
+                if not event.is_private and event.reply_to_msg_id:
+                    try:
+                        replied = await event.get_reply_message()
+                        is_reply_to_me = bool(replied and replied.sender_id == me.id)
+                    except Exception:
+                        is_reply_to_me = False
+                is_relevant_group_message = (not event.is_private) and (bool(event.mentioned) or is_reply_to_me)
+                notice_key = (owner_id, int(chat_id), int(event.id))
+                now = time.time()
+                for key, expires_at in list(storage_notice_cache.items()):
+                    if expires_at < now:
+                        storage_notice_cache.pop(key, None)
 
-                # لا يعيد تحويل أي رسالة تصل داخل مجموعة التخزين نفسها.
-                if (is_mention or is_private_msg) and chat_id != storage_group_id:
+                # لا تنشئ مفتاح التخزين إلا لرسالة واردة تخص المستخدم ولها مرسل فعلي.
+                # رسائل القنوات الخارجة وبعض رسائل الخدمة لا تحمل sender_id، ويجب ألا توقف الأوامر بسبب ذلك.
+                if (
+                    (is_private_msg or is_relevant_group_message)
+                    and sender_id is not None
+                    and chat_id is not None
+                    and chat_id != storage_group_id
+                    and notice_key not in storage_notice_cache
+                ):
+                    # الخاص: المصدر هو الشخص. القروب: المصدر هو الشخص داخل القروب نفسه.
+                    source_key = ("private", int(sender_id)) if is_private_msg else ("group", int(chat_id), int(sender_id))
+                    previous_source = storage_active_sources.get(owner_id)
+                    show_notice_card = previous_source != source_key
+                    storage_notice_cache[notice_key] = now + 3600
                     try:
                         sender_entity = await event.get_sender()
-                        sender_name = sender_entity.first_name or "بدون اسم"
+                        sender_name = getattr(sender_entity, "first_name", None) or "بدون اسم"
                         if getattr(sender_entity, "last_name", None):
                             sender_name += f" {sender_entity.last_name}"
                         sender_username = f"@{sender_entity.username}" if getattr(sender_entity, "username", None) else "ماعنده"
+                        has_media = bool(event.media)
 
-                        # يحوّل الرسالة الأصلية أولاً، للنصوص والوسائط معاً.
-                        await client_inst.forward_messages(storage_group_id, event.message)
-
-                        if event.is_private:
-                            # لا يوجد رابط HTTP مباشر لرسالة خاصة؛ هذا الرابط يفتح نفس المحادثة عند المرسل.
-                            msg_link = f"tg://openmessage?user_id={sender_id}&message_id={event.id}"
-                            alert_text = (
-                                "🔔 **#تنبيه_جديد**\n\n"
-                                "▪️ **المكان :** محادثة خاصة\n"
-                                "▪️ **الايدي :** خاص\n\n"
-                                "👤 **المرسل :**\n"
-                                f"- الاسم : {sender_name}\n"
-                                f"- الايدي : `{sender_id}`\n"
-                                f"- اليوزر : {sender_username}\n\n"
-                                f"🔗 **الرابط :** [اضغط هنا للذهاب للرسالة]({msg_link})"
-                            )
+                        if is_private_msg:
+                            if show_notice_card:
+                                private_notice = (
+                                    f"- المستخــدم {sender_name} ارسـل لك رسالة جـديـدة 💬\n"
+                                    f"- ايديـه ◂ `{sender_id}`\n"
+                                    f"- يوزره ◂ {sender_username}"
+                                )
+                                await client_inst.send_message(storage_group_id, private_notice, parse_mode="md")
+                                storage_active_sources[owner_id] = source_key
+                            # رسالة الخاص تتحول دائماً، لكن بطاقة التنبيه لا تتكرر لنفس المصدر.
+                            try:
+                                await client_inst.forward_messages(storage_group_id, event.message)
+                            except Exception:
+                                if has_media:
+                                    stored_path = await client_inst.download_media(event.message, file=TEMP_DIR)
+                                    if stored_path:
+                                        try:
+                                            await client_inst.send_file(storage_group_id, stored_path, caption=event.raw_text or "")
+                                        finally:
+                                            _safe_remove(stored_path)
+                                elif event.raw_text:
+                                    await client_inst.send_message(storage_group_id, event.raw_text)
                         else:
                             chat_entity = await event.get_chat()
                             chat_title = getattr(chat_entity, "title", "مجموعة")
-                            chat_id_str = str(chat_id)
                             chat_username = getattr(chat_entity, "username", None)
-
                             if chat_username:
                                 msg_link = f"https://t.me/{chat_username}/{event.id}"
                             else:
                                 internal_chat_id = str(chat_id).replace("-100", "")
                                 msg_link = f"https://t.me/c/{internal_chat_id}/{event.id}"
 
-                            alert_text = (
-                                "🔔 **#تنبيه_تاك**\n\n"
-                                "▪️ **المجموعة :**\n"
-                                f"- الاسم : {chat_title}\n"
-                                f"- الايدي : `{chat_id_str}`\n\n"
-                                "👤 **المرسل :**\n"
-                                f"- الاسم : {sender_name}\n"
-                                f"- الايدي : `{sender_id}`\n"
-                                f"- اليوزر : {sender_username}\n\n"
-                                f"🔗 **الرابط :** [اضغط هنا للذهاب للرسالة]({msg_link})"
-                            )
-
-                        await client_inst.send_message(
-                            storage_group_id,
-                            alert_text,
-                            link_preview=False,
-                            parse_mode="md"
-                        )
+                            # القروبات: نرسل بطاقة التاك فقط، ولا نُحوّل رسالة الشخص أو وسائطه نهائياً.
+                            if show_notice_card:
+                                message_text = event.raw_text or ("رسالة تحتوي على وسائط" if has_media else "رسالة بدون نص")
+                                media_note = "\n\n📎 **الرسالة تحتوي على وسائط (لا يتم تحويل وسائط القروبات).**" if has_media else ""
+                                group_notice = (
+                                    "#تـنـبـيـه_تــاك\n\n"
+                                    "◂ **المجمـوعـة :**\n"
+                                    f"- الاســم : {chat_title}\n"
+                                    f"- الايدي : `{chat_id}`\n\n"
+                                    "◂ **المـرسـل :**\n"
+                                    f"- الاســم : {sender_name}\n"
+                                    f"- الايدي : `{sender_id}`\n"
+                                    f"- اليـوزر : {sender_username}\n\n"
+                                    f"◂ **الرسالـة :** {message_text}\n\n"
+                                    f"◂ **الرابـط :** [اضغـط هـنـا]({msg_link}){media_note}"
+                                )
+                                await client_inst.send_message(storage_group_id, group_notice, link_preview=False, parse_mode="md")
+                                storage_active_sources[owner_id] = source_key
                     except Exception as e:
                         print(f"Storage group alert error: {e}")
             # ------------------------------------------------
@@ -2877,6 +4015,8 @@ def main_menu_keyboard(user_id):
         buttons.append([Button.inline("🎟️ كود تفعيل التسطير", b"enter_code_start")])
     if not source_active:
         buttons.append([Button.inline("⭐ كود تفعيل مميزات السورس", b"enter_source_code_start")])
+    if not (tastir_active and source_active):
+        buttons.append([Button.inline("✨ كود تفعيل جميع الصلاحيات", b"enter_all_code_start")])
     if tastir_active or source_active:
         buttons.append([Button.inline("🔑 تسجيل الدخول / ربط الحساب", b"login_start")])
         if tastir_active:
@@ -2898,12 +4038,18 @@ def tastir_section_keyboard(user_id):
         [Button.inline("🔙 رجوع", b"main_menu")]
     ]
 
+def flush_section_keyboard():
+    return [
+        [Button.inline("🚀 التفليش عبر البوت", b"flush_menu")],
+        [Button.inline("📖 شرح التفليش اليدوي", b"manual_flush_info")],
+        [Button.inline("🔙 رجوع إلى مميزات السورس", b"source_features_menu")],
+    ]
+
+
 def flush_menu_keyboard():
     return [
         [Button.inline("🚀 بدء التفليش", b"start_flush_flow")],
-        [Button.inline("📖 شرح كيف تفلش يدويا", b"manual_flush_info")],
-        [Button.inline("⚡ سرعة التفليش", b"flush_speed_menu")],
-        [Button.inline("🔙 رجوع", b"source_features_menu")]
+        [Button.inline("🔙 رجوع", b"flush_section")]
     ]
 
 def flush_speed_menu_keyboard(user_id):
@@ -2912,18 +4058,16 @@ def flush_speed_menu_keyboard(user_id):
     return [
         [Button.inline(f"⏱️ 3 ثواني {'✅' if spd == 3.0 else ''}", b"fspd_3"), Button.inline(f"⏱️ 2 ثانية {'✅' if spd == 2.0 else ''}", b"fspd_2")],
         [Button.inline(f"⏱️ 1 ثانية {'✅' if spd == 1.0 else ''}", b"fspd_1"), Button.inline(f"⏱️ 0.5 ثانية {'✅' if spd == 0.5 else ''}", b"fspd_0.5")],
-        [Button.inline("🔙 رجوع", b"flush_menu")]
+        [Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]
     ]
 
 def source_features_menu_keyboard():
-    # مميزات المستخدم القديمة تبقى أولاً في مواقعها، ثم تأتي الأقسام الجديدة أسفلها.
+    # مميزات المستخدم القديمة تبقى أولاً، والتفليش أصبح قسماً مستقلاً.
     return [
-        [Button.inline("💥 بدأ التفليش", b"start_flush_flow"), Button.inline("📖 شرح التفليش", b"manual_flush_info")],
-        [Button.inline("📦 مجموعة التخزين", b"storage_group_menu")],
-        [Button.inline("🔍 فكرة بحث اليوتيوب", b"feature_youtube_info"), Button.inline("📌 فكرة التثبيت", b"feature_pin_info")],
+        [Button.inline("💥 قسم التفليش", b"flush_section"), Button.inline("📦 مجموعة التخزين", b"storage_group_menu")],
+        [Button.inline("📌 فكرة التثبيت", b"feature_pin_info")],
         [Button.inline("🧹 مسح الشامل", b"info_purge_all"), Button.inline("🔢 مسح بالعدد المحدد", b"info_purge_quick")],
         [Button.inline("🔇 الكتم الشامل", b"mute_menu"), Button.inline("🎙️ الصوتيات", b"voice_menu")],
-        # الأقسام الجديدة التي تمت إضافتها لاحقاً.
         [Button.inline("👤 الحساب", b"section_account"), Button.inline("📬 الترحيب والردود", b"section_welcome")],
         [Button.inline("🧧 حفظ الذاتية", b"section_self_save"), Button.inline("📍 النشر التلقائي", b"section_publish")],
         [Button.inline("🎧 البحث والتحميل", b"section_download"), Button.inline("🧰 الأدوات", b"section_tools")],
@@ -2974,7 +4118,8 @@ def download_section_keyboard():
 def tools_section_keyboard():
     return [
         [Button.inline("🔗 رابط الحساب", b"account_link_info"), Button.inline("✍️ الكتابة والخطوط", b"writing_menu")],
-        [Button.inline("📟 الآلة الحاسبة", b"calculator_menu"), Button.inline("🖼 الصيغ والتحويل", b"conversion_menu")],
+        [Button.inline("📟 الآلة الحاسبة", b"calculator_menu"), Button.inline("🏧 الترجمة", b"translation_info")],
+        [Button.inline("🖼 الصيغ والتحويل", b"conversion_menu")],
         [Button.inline("◀️ رجوع", b"source_features_menu")]
     ]
 
@@ -2982,11 +4127,71 @@ def tools_section_keyboard():
 def calculator_keyboard():
     return [
         [Button.inline("1", b"calc_1"), Button.inline("2", b"calc_2"), Button.inline("3", b"calc_3"), Button.inline("+", b"calc_+")],
-        [Button.inline("4", b"calc_4"), Button.inline("5", b"calc_5"), Button.inline("6", b"calc_6"), Button.inline("-", b"calc_-")],
+        [Button.inline("4", b"calc_4"), Button.inline("5", b"calc_5"), Button.inline("6", b"calc_6"), Button.inline("−", b"calc_-")],
         [Button.inline("7", b"calc_7"), Button.inline("8", b"calc_8"), Button.inline("9", b"calc_9"), Button.inline("×", b"calc_*")],
         [Button.inline(".", b"calc_."), Button.inline("0", b"calc_0"), Button.inline("⌫", b"calc_back"), Button.inline("÷", b"calc_/")],
         [Button.inline("AC", b"calc_clear"), Button.inline("=", b"calc_equals")]
     ]
+
+
+def _format_calculator_value(value):
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("ناتج غير صالح")
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.12g}"
+    return str(value)
+
+
+def process_calculator_action(previous, action):
+    """منطق حاسبة محدود وآمن: + - × ÷ . = وAC والحذف."""
+    if isinstance(previous, dict):
+        expression = str(previous.get("expression", ""))
+        just_evaluated = bool(previous.get("just_evaluated", False))
+    else:
+        expression = str(previous or "")
+        just_evaluated = False
+
+    operators = "+-*/"
+    if expression == "خطأ":
+        expression, just_evaluated = "", False
+
+    if action == "clear":
+        expression, just_evaluated = "", False
+    elif action == "back":
+        expression = expression[:-1]
+        just_evaluated = False
+    elif action == "equals":
+        try:
+            if not expression or expression[-1] in operators or not re.fullmatch(r"[0-9+\-*/(). ]+", expression):
+                raise ValueError("صيغة غير صالحة")
+            expression = _format_calculator_value(eval(expression, {"__builtins__": {}}, {}))
+            just_evaluated = True
+        except Exception:
+            expression, just_evaluated = "خطأ", True
+    elif action in operators:
+        if expression == "":
+            expression = "-" if action == "-" else ""
+        elif expression[-1] in operators:
+            expression = expression[:-1] + action
+        else:
+            expression += action
+        just_evaluated = False
+    elif action == ".":
+        if just_evaluated:
+            expression, just_evaluated = "0.", False
+        else:
+            current_number = re.split(r"[+\-*/]", expression)[-1]
+            if "." not in current_number:
+                expression += "." if current_number else "0."
+    elif action.isdigit():
+        if just_evaluated:
+            expression = ""
+        expression += action
+        just_evaluated = False
+
+    return {"expression": expression, "just_evaluated": just_evaluated}
 
 
 def clone_menu_keyboard():
@@ -3128,19 +4333,53 @@ def speed_menu_keyboard():
 
 def admin_menu_keyboard():
     return [
+        [Button.inline("👥 قسم المستخدمين", b"admin_users_menu"), Button.inline("👑 قسم المسؤولين", b"admin_admins_menu")],
+        [Button.inline("📝 إدارة الكلمات والجمل", b"admin_words_menu"), Button.inline("🎟️ أكواد التفعيل", b"admin_codes_menu")],
+        [Button.inline("💾 إدارة بيانات البوت", b"admin_data_menu")],
+        [Button.inline("📢 إذاعة عامة", b"broadcast_start"), Button.inline("📊 إحصائيات النظام", b"admin_stats")],
+        [Button.inline("🔙 رجوع", b"main_menu")]
+    ]
+
+
+def admin_users_keyboard():
+    return [
+        [Button.inline("📋 قائمة المستخدمين", b"list_users")],
+        [Button.inline("➕ تفعيل مستخدم بالآيدي", b"manual_activate_start"), Button.inline("📅 تمديد اشتراك", b"extend_subscription_start")],
+        [Button.inline("🗑️ حذف مستخدم نهائياً", b"revoke_user_start")],
+        [Button.inline("◀️ رجوع", b"admin_menu")]
+    ]
+
+
+def admin_admins_keyboard():
+    return [
+        [Button.inline("👥 قائمة المسؤولين", b"list_admins")],
+        [Button.inline("➕ إضافة مسؤول", b"add_admin_start"), Button.inline("❌ حذف مسؤول", b"delete_admin_start")],
+        [Button.inline("◀️ رجوع", b"admin_menu")]
+    ]
+
+
+def admin_words_keyboard():
+    return [
+        [Button.inline("📝 إدارة التسطير الأساسي", b"admin_tastir_menu")],
+        [Button.inline("🎯 إدارة الفرديات الأساسية", b"admin_fardiyyat_menu")],
+        [Button.inline("◀️ رجوع", b"admin_menu")]
+    ]
+
+
+def admin_codes_keyboard():
+    return [
         [Button.inline("🎟️ توليد كود التسطير", b"gen_code"), Button.inline("⭐ توليد كود السورس", b"gen_source_code")],
-        [Button.inline("➕ تفعيل البوت لمستخدم بالايدي", b"manual_activate_start")],
-        [Button.inline("📅 تمديد اشتراك مستخدم", b"extend_subscription_start")],
-        [Button.inline("📋 سجل التفعيل", b"activation_log_menu"), Button.inline("⌛ المنتهية اليوم", b"expired_today_menu")],
+        [Button.inline("✨ توليد كود جميع الصلاحيات", b"gen_all_code")],
+        [Button.inline("📋 سجل التفعيل", b"activation_log_menu"), Button.inline("⌛ الأكواد المنتهية", b"expired_codes_menu")],
+        [Button.inline("◀️ رجوع", b"admin_menu")]
+    ]
+
+
+def admin_data_keyboard():
+    return [
         [Button.inline("💾 إنشاء نسخة احتياطية", b"backup_export"), Button.inline("📥 استيراد نسخة احتياطية", b"backup_import_start")],
         [Button.inline("📱 إدارة جلسات الحسابات", b"sessions_menu"), Button.inline("⚠️ سجل الأخطاء", b"admin_error_log_menu")],
-        [Button.inline("📢 إذاعة عامة", b"broadcast_start")],
-        [Button.inline("📝 إدارة التسطير الأساسي", b"admin_tastir_menu"), Button.inline("🎯 إدارة الفرديات الأساسية", b"admin_fardiyyat_menu")],
-        [Button.inline("👥 قائمة المسؤولين", b"list_admins"), Button.inline("📋 قائمة المستخدمين", b"list_users")],
-        [Button.inline("➕ إضافة مسؤول", b"add_admin_start"), Button.inline("❌ حذف مسؤول", b"delete_admin_start")],
-        [Button.inline("🗑️ حذف مستخدم نهائياً", b"revoke_user_start")],
-        [Button.inline("📊 إحصائيات النظام", b"admin_stats")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("◀️ رجوع", b"admin_menu")]
     ]
 
 
@@ -3180,13 +4419,18 @@ async def start_handler(event):
         code = args[1].strip()
         success, days = await apply_activation_code(user_id, code, event)
         if success:
-            await event.respond(f"✅ تم تفعيل الاشتراك بنجاح لمدة {days} يوم.")
+            await event.respond(f"✅ تم تفعيل اشتراك التسطير بنجاح لمدة {days} يوم.")
         else:
             success_src, days_src = await apply_source_activation_code(user_id, code, event)
             if success_src:
                 await event.respond(f"✅ تم تفعيل مميزات السورس بنجاح لمدة {days_src} يوم.")
             else:
-                await event.respond("❌ رمز التفعيل غير صالح أو تم استخدامه سابقاً.")
+                success_all, days_all = await apply_full_activation_code(user_id, code, event)
+                if success_all:
+                    await event.respond(f"✅ تم تفعيل كود جميع الصلاحيات بنجاح لمدة {days_all} يوم. تم تفعيل التسطير ومميزات السورس معاً.")
+                else:
+                    await report_admin_error("كود تفعيل غير صالح", "محاولة كود غير صالح أو مستخدم", user_id)
+                    await event.respond("❌ رمز التفعيل غير صالح أو تم استخدامه سابقاً.")
 
     me = await bot.get_me()
     bot_username = me.username or "bot"
@@ -3204,31 +4448,19 @@ async def callback_handler(event):
     data = event.data
     init_user_db(user_id)
 
-    if data in [b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"flush_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu", b"clone_menu", b"welcome_menu", b"auto_publish_menu", b"conversion_menu", b"id_menu"]:
+    if data in [b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"flush_section", b"flush_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu", b"clone_menu", b"welcome_menu", b"auto_publish_menu", b"conversion_menu", b"id_menu"]:
         user_states.pop(user_id, None)
 
     if data.startswith(b"calc_"):
-        key = (event.chat_id, event.message.id, user_id)
-        expression = calculator_sessions.get(key, "")
+        key = (event.chat_id, event.message_id, user_id)
         action = data.decode()[5:]
-        if action == "clear":
-            expression = ""
-        elif action == "back":
-            expression = expression[:-1]
-        elif action == "equals":
-            try:
-                if not expression or not re.fullmatch(r"[0-9+\-*/(). ]+", expression):
-                    raise ValueError("صيغة غير صالحة")
-                value = eval(expression, {"__builtins__": {}}, {})
-                expression = str(value)
-            except Exception:
-                expression = "خطأ"
-        else:
-            expression = "" if expression == "خطأ" else expression
-            expression += action
-        calculator_sessions[key] = expression
-        display = expression or "0"
-        await event.edit(f"📟 **الآلة الحاسبة**\n\n`{display}`", buttons=calculator_keyboard())
+        session = process_calculator_action(calculator_sessions.get(key, ""), action)
+        calculator_sessions[key] = session
+        display = session["expression"] or "0"
+        try:
+            await event.edit(f"📟 **الآلة الحاسبة**\n\n`{display}`", buttons=calculator_keyboard())
+        except MessageNotModifiedError:
+            await event.answer()
         return
 
     if data == b"main_menu":
@@ -3243,23 +4475,38 @@ async def callback_handler(event):
         except MessageNotModifiedError:
             await event.answer()
 
+    elif data == b"flush_section":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        await event.edit("💥 **قسم التفليش:**\n\nاختر التفليش عبر البوت أو راجع شرح الأوامر اليدوية.", buttons=flush_section_keyboard())
+
     elif data == b"flush_menu":
         if not is_source_subscribed(user_id):
             await event.answer("⚠️ لا يمكنك استخدام أي ميزة بالسورس إلا بكود تفعيل. الرجاء التواصل مع المطور وإرسال كود تفعيل مميزات السورس.", alert=True)
             return
-        await event.edit("⚡ **قائمة التفليش:**\n\nاختر ما يناسبك من الخيارات أدناه:", buttons=flush_menu_keyboard())
+        await event.edit("⚡ **قائمة التفليش عبر البوت:**\n\nاختر ما يناسبك من الخيارات أدناه:", buttons=flush_menu_keyboard())
 
     elif data == b"manual_flush_info":
         if not is_source_subscribed(user_id):
             await event.answer("⚠️ لا يمكنك استخدام أي ميزة بالسورس إلا بكود تفعيل. الرجاء التواصل مع المطور وإرسال كود تفعيل مميزات السورس.", alert=True)
             return
         txt = (
-            "📖 **شرح كيف تفلش يدويا:**\n\n"
-            "• يمكنك استخدام أمر التفليش السريع عبر كتابة `.تفليش` في أي مجموعة أو قناة يمتلك حسابك (اليوزر بوت) صلاحية حظر المستخدمين فيها.\n"
-            "• سيقوم الحساب بحذف أمرك تلقائياً وبدء تفليش وطرد جميع الأعضاء بسرعة 0.5 ثانية لكل عضو.\n"
-            "• سيقوم البوت بإرسال إشعارات جاري التفليش والإحصائيات النهائية أو تفاصيل ما حدث عند اكتمال العملية أو سحب الصلاحية."
+            "⤾ اوامـر التفلـيش اليدوي 🚷\n"
+            "⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆\n\n"
+            "• `.تفليش بالطرد`\n"
+            "≫ لكتابة الأمر داخل المجموعة أو وضع الآيدي بعد الأمر.\n\n"
+            "• `.تفليش بالحظر`\n"
+            "≫ لكتابة الأمر داخل المجموعة أو وضع الآيدي بعد الأمر.\n\n"
+            "• `.ايقاف التفليش`\n"
+            "≫ لإيقاف التفليش في حال كان شغالاً."
         )
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"flush_menu")]])
+        await event.edit(
+            txt,
+            buttons=[
+                [Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]
+            ]
+        )
 
     elif data == b"flush_speed_menu":
         if not is_source_subscribed(user_id):
@@ -3288,7 +4535,7 @@ async def callback_handler(event):
         await event.edit(
             "🚀 **بدء التفليش:**\n\n"
             "يرجى إرسال **رابط القروب/القناة** أو **المعرف الرقمي (ID)** الخاص بالقروب أو القناة الآن:",
-            buttons=[[Button.inline("🔙 رجوع", b"flush_menu")]]
+            buttons=[[Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]]
         )
 
     elif data.startswith(b"confirm_flush_action_"):
@@ -3302,7 +4549,7 @@ async def callback_handler(event):
         
         if ans == "no":
             user_states.pop(user_id, None)
-            await event.edit("❌ تم إلغاء عملية التفليش.", buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+            await event.edit("❌ تم إلغاء عملية التفليش.", buttons=[[Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]])
             return
 
         client = user_clients.get(user_id)
@@ -3312,49 +4559,95 @@ async def callback_handler(event):
             
         user_states.pop(user_id, None)
         me = await client.get_me()
-        status_msg = await event.edit("⏳ جاري بدء التفليش وطرد جميع الأعضاء...")
+        # السرعة التي اختارها المستخدم تطبق فعلياً؛ الحد الأدنى يحمي الحلقة من قيمة سالبة أو صفرية.
+        selected_speed = 0.01
+        selected_speed = max(0.05, min(selected_speed, 5.0))
+        status_msg = await event.edit(
+            f"⏳ جاري بدء التفليش...\n\n• السرعة: `{selected_speed}` ثانية\n• اضغط إيقاف التفليش في أي وقت.",
+            buttons=[[Button.inline("⏹️ إيقاف التفليش", f"stop_bot_flush_{chat_id}")]]
+        )
+        task_key = (user_id, int(chat_id))
+        previous_task = bot_flush_tasks.get(task_key)
+        if previous_task and not previous_task.done():
+            previous_task.cancel()
         
         async def fast_flush():
             count = 0
-            error_occurred = False
-            err_msg = ""
+            failed = 0
+            start_time = time.time()
             try:
                 chat_entity = await client.get_entity(chat_id)
                 async for member in client.iter_participants(chat_entity):
-                    user = member
-                    if user.id == me.id:
+                    if member.id == me.id:
                         continue
                     try:
-                        await client(EditBannedRequest(chat_entity, user.id, ChatBannedRights(until_date=None, view_messages=True)))
+                        await client(EditBannedRequest(chat_entity, member.id, ChatBannedRights(until_date=None, view_messages=True)))
                         count += 1
-                        await asyncio.sleep(0.5)
-                    except Exception as e:
-                        err_str = str(e)
+                        await asyncio.sleep(selected_speed)
+                    except Exception as exc:
+                        err_str = str(exc).upper()
                         if "FLOOD_WAIT" in err_str:
                             match = re.search(r"\d+", err_str)
                             wait_time = int(match.group()) if match else 5
-                            await status_msg.edit(f"⚠️ تم اكتشاف حظر مؤقت من تيليجرام. جارٍ الانتظار لمدة {wait_time} ثانية...")
+                            await status_msg.edit(
+                                f"⚠️ تم تقييد السرعة مؤقتاً من تيليجرام. جارٍ الانتظار `{wait_time}` ثانية...\n\n• تم التعامل مع: `{count}`",
+                                buttons=[[Button.inline("⏹️ إيقاف التفليش", f"stop_bot_flush_{chat_id}")]]
+                            )
                             await asyncio.sleep(wait_time)
                             continue
-                        elif "USER_ADMIN_INVALID" in err_str or "CHAT_ADMIN_REQUIRED" in err_str or "RIGHTS_NOT_AVAILABLE" in err_str:
-                            error_occurred = True
-                            err_msg = "انسحبت صلاحية الحظر أو حدث خطأ في الصلاحيات."
-                            break
-                        else:
-                            pass
-
-                if error_occurred:
-                    await status_msg.edit(f"⚠️ **توقف التفليش:** {err_msg}\n📊 **الإحصائيات النهائية:** تم طرد {count} عضواً قبل توقف الصلاحية.", buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
-                else:
-                    await status_msg.edit(f"✅ تمت التصفية بنجاح!\n📊 **إحصائيات التفليش:** تم طرد {count} عضواً من القناة/المجموعة.", buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
-            except Exception as e:
-                await status_msg.edit(f"❌ حدث خطأ أثناء التفليش: {e}\n📊 **الاحصائيات:** تم طرد {count} عضواً.", buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+                        if any(marker in err_str for marker in ("USER_ADMIN_INVALID", "CHAT_ADMIN_REQUIRED", "RIGHTS_NOT_AVAILABLE")):
+                            raise PermissionError("انسحبت صلاحية الحظر أو لم تعد متاحة أثناء التفليش.")
+                        # نجرب الطرد العادي للحالات التي لا تقبل الحظر المباشر.
+                        try:
+                            await client.delete_chat_user(chat_entity, member.id)
+                            count += 1
+                            await asyncio.sleep(selected_speed)
+                        except Exception:
+                            failed += 1
+            except asyncio.CancelledError:
+                elapsed = round(time.time() - start_time, 1)
+                await status_msg.edit(
+                    f"⏹️ **تم إيقاف التفليش.**\n\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`\n• الوقت: `{elapsed}` ثانية",
+                    buttons=[[Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]]
+                )
+                raise
+            except Exception as exc:
+                elapsed = round(time.time() - start_time, 1)
+                await status_msg.edit(
+                    f"⚠️ **توقف التفليش:** {exc}\n\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`\n• الوقت: `{elapsed}` ثانية",
+                    buttons=[[Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]]
+                )
+            else:
+                elapsed = round(time.time() - start_time, 1)
+                await status_msg.edit(
+                    f"✅ **انتهى التفليش.**\n\n• تم التعامل مع: `{count}` عضواً\n• فشل: `{failed}`\n• السرعة: `{selected_speed}` ثانية\n• الوقت: `{elapsed}` ثانية",
+                    buttons=[[Button.inline("🔙 رجوع إلى قسم التفليش", b"flush_section")]]
+                )
+            finally:
+                bot_flush_tasks.pop(task_key, None)
                 
-        asyncio.create_task(fast_flush())
+        bot_flush_tasks[task_key] = asyncio.create_task(fast_flush())
+
+    elif data.startswith(b"stop_bot_flush_"):
+        if not is_source_subscribed(user_id):
+            await event.answer("⚠️ هذه المهمة تخص مستخدم آخر أو اشتراكك غير فعال.", alert=True)
+            return
+        try:
+            target_chat_id = int(data.decode().rsplit("_", 1)[-1])
+        except Exception:
+            await event.answer("تعذر تحديد مهمة التفليش.", alert=True)
+            return
+        task = bot_flush_tasks.get((user_id, target_chat_id))
+        if task and not task.done():
+            task.cancel()
+            await event.answer("⏹️ جاري إيقاف التفليش...", alert=False)
+        else:
+            await event.answer("لا توجد عملية تفليش شغالة حالياً.", alert=True)
+        return
 
     elif data == b"cancel_flush":
         user_states.pop(user_id, None)
-        await event.edit("⚡ **قائمة التفليش:**", buttons=flush_menu_keyboard())
+        await event.edit("💥 **قسم التفليش:**", buttons=flush_section_keyboard())
 
     elif data == b"tastir_section":
         if not is_subscribed(user_id):
@@ -3491,26 +4784,77 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(AUTO_PUBLISH_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit("📍 **قائمة النشر التلقائي:**\n\nيمكنك عرض شرح الأوامر، ومتابعة عمليات النشر أو إيقافها من الأزرار.", buttons=auto_publish_menu_keyboard())
+
+    elif data == b"publish_required_add":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_publish_required_add"}
+        await event.edit("➕ أرسل يوزر أو رابط القروب/القناة المطلوب اشتراك حساب النشر فيه تلقائياً قبل النشر.\n\nمثال: `@channel` أو `https://t.me/channel`", buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+
+    elif data == b"publish_required_list":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        items = users_db[user_id].get("publish_required_chats", [])
+        body = "\n".join(f"• `{item}`" for item in items) if items else "لا توجد اشتراكات نشر مضافة."
+        await event.edit("📋 **اشتراكات النشر الإلزامية:**\n\n" + body, buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+
+    elif data == b"publish_required_delete_start":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        items = users_db[user_id].get("publish_required_chats", [])
+        if not items:
+            await event.answer("لا توجد اشتراكات نشر لحذفها.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_publish_required_delete"}
+        await event.edit("🗑️ أرسل نفس اليوزر أو الرابط الذي تريد حذفه من اشتراكات النشر.\n\n" + "\n".join(f"• `{item}`" for item in items), buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
 
     elif data == b"auto_publish_info":
         await event.edit(
-            "📖 **أوامر النشر التلقائي:**\n\n"
-            "• داخل المجموعة: `.نشر المدة العدد تحويل` أو `.واو المدة العدد تحويل` بالرد على الرسالة.\n"
-            "• خارج المجموعة: `.ستارت المدة العدد آيدي_القروب تحويل` بالرد على الرسالة.\n\n"
-            "⚠️ كلمة `تحويل` اختيارية: لا تكتبها للنشر بدون تحويل المصدر، واكتبها في نهاية الأمر للتحويل العادي للنص أو الوسائط.\n"
-            "إذا منعت الوجهة تحويل محتوى القناة أو حدث أي خطأ، يتوقف النشر ويصلك السبب.\n\n"
-            "• `.النشر الشغال` لعرض العمليات.\n• `.بس` لإيقاف نشر القروب الحالي.\n• `.ايقاف النشر` لإيقاف كل عملياتك.\n\n"
-            "ضع `999` كعدد للتشغيل الطويل.",
+            "⤾ اوامــر النـشــر التـلـقـائـي  📍\n"
+            "⋆————‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 ›————⋆  \n\n"
+            "← للنشر من داخـل المجمـوعة ↓  \n"
+            "• .نشر + عدد الثواني + عدد المرات + تحويل  \n"
+            "• .واو + عدد الثواني + عدد المرات + تحويل  \n"
+            "↞ بـالـرد علـى الرسالـه المـراد نشرهـا 🚀\n\n"
+            "← للنشر من خارج المجمـوعة 🔥 ↓  \n"
+            "• .ستارت + عدد الثواني + عدد المرات + ايدي المجموعة + تحويل  \n"
+            "↞ بالـرد على الرسالة المـراد نشـرها 🚀\n\n"
+            "• ملاحظات هامـه ❕❔\n"
+            "1 - كـل اوامـر النشـر تدعم الملصقات المميزه ⭐ + تدعـم صـورة واحـدة  \n"
+            "2 - يمكنك الحصـول على ايدي المجموعات من هنا @is_idbot 🤖\n"
+            "3 - للنشـر بـدون توقـف ضـع عـدد مـرات 999  \n\n"
+            "• .النشر الشغال  \n"
+            "↞ لـ معـرفـة عمليات النشـر الشغالـه حاليا ⛄  \n\n"
+            "• .بس  \n"
+            "↞ لـ إيقـاف النشر التلقائي في مجموعه معينه 📌  \n"
+            "↞ قـم بكتابـه الامـر داخل المجموعة  \n\n"
+            "• .ايقاف النشر  \n"
+            "↞ لـ إيقـاف جميـع عمليـات النشـر التلقـائـي المرتبطـة بـك 🎡  \n\n"
+            "↜ ملاحظـه ❕  \n"
+            "- اوامـر النشـر التلقـائي قد تكـون خطيـره علـى بعـض الحسـابـات بسبـب سياسـة تلجـرام\n\n"
+            "• التحويل ↔\n"
+            "- لا تكتب كلمة تحويل = ينشر البوت نسخة من النص أو الوسيط بدون إظهار مصدر الرسالة.\n"
+            "- اكتب تحويل في نهاية الأمر = يرسلها كتحويل ويظهر مصدرها.\n"
+            "مثال: `.نشر 3 10 تحويل`\n"
+            "مثال بدون تحويل: `.نشر 3 10`",
             buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]]
         )
-
     elif data == b"auto_publish_running":
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        keys = [key for key, task in auto_publish_tasks.items() if key[0] == user_id and not task.done()]
-        text = "📊 **عمليات النشر الشغالة:**\n\n" + ("\n".join(f"• القروب: `{key[1]}`" for key in keys) if keys else "لا توجد عمليات نشر حالياً.")
+        jobs = [job for job in users_db.get(user_id, {}).get("auto_publish_jobs", []) if (user_id, int(job.get("target_chat_id", 0))) in auto_publish_tasks]
+        client = user_clients.get(user_id)
+        rows = []
+        for job in jobs:
+            target_id = int(job.get("target_chat_id", 0))
+            target_name = await _publish_target_name(client, target_id) if client else str(target_id)
+            rows.append(f"• **{target_name}** — `{target_id}`\n  تم إرسال: `{job.get('completed', 0)}` من `{job.get('count', 0)}`")
+        text = "📊 **عمليات النشر الشغالة:**\n\n" + ("\n".join(rows) if rows else "لا توجد عمليات نشر حالياً.")
         await event.edit(text, buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
 
     elif data == b"auto_publish_stop_all":
@@ -3526,7 +4870,7 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(CONVERSION_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(CONVERSION_GUIDE, buttons=tools_back_keyboard())
 
     elif data in [b"convert_image_start", b"convert_sticker_start", b"convert_audio_start", b"convert_voice_start"]:
         if not is_source_subscribed(user_id):
@@ -3556,7 +4900,7 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(ID_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(ID_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
 
     elif data == b"show_my_id":
         client = user_clients.get(user_id)
@@ -3588,9 +4932,9 @@ async def callback_handler(event):
         await event.edit("⏳ جاري جمع بيانات حسابك وقنواتك وقروباتك...")
         try:
             report = await get_my_data_report(client, user_id)
-            await event.edit(report, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+            await event.edit(report, buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
         except Exception as e:
-            await event.edit(f"❌ تعذر جلب البيانات:\n`{e}`", buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+            await event.edit(f"❌ تعذر جلب البيانات:\n`{e}`", buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
 
     elif data == b"account_link_info":
         if not is_source_subscribed(user_id):
@@ -3602,19 +4946,25 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(CREATION_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(CREATION_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
+
+    elif data == b"translation_info":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        await event.edit(TRANSLATION_GUIDE, buttons=tools_back_keyboard())
 
     elif data == b"self_save_menu":
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(SELF_SAVE_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(SELF_SAVE_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"section_self_save")]])
 
     elif data == b"stats_menu":
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit(STATS_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+        await event.edit(STATS_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
 
     elif data in [b"section_account", b"section_welcome", b"section_self_save", b"section_publish", b"section_download", b"section_tools"]:
         if not is_source_subscribed(user_id):
@@ -3647,7 +4997,7 @@ async def callback_handler(event):
             b"broadcast_menu": BROADCAST_GUIDE,
             b"leave_cleanup_menu": LEAVE_CLEANUP_GUIDE
         }
-        buttons = tools_back_keyboard() if data == b"writing_menu" else section_back_keyboard()
+        buttons = tools_back_keyboard() if data == b"writing_menu" else [[Button.inline("◀️ رجوع", b"section_download")]]
         await event.edit(guide_map[data], buttons=buttons)
 
     elif data == b"calculator_menu":
@@ -3763,20 +5113,27 @@ async def callback_handler(event):
 
     elif data == b"feature_pin_info":
         if not is_source_subscribed(user_id):
-            await event.answer("⚠️ لا يمكنك استخدام أي ميزة بالسورس إلا بكود تفعيل. الرجاء التواصل مع المطور وإرسال كود تفعيل مميزات السورس.", alert=True)
+            await event.answer(source_lock_message(), alert=True)
             return
         txt = (
-            "📌 **فكرة التثبيت:**\n\n"
-            "يتيح لك السورس ميزة تثبيت الرسائل المهمة بسهولة تامة وبأمر سريع عبر حسابك الشخصي (اليوزر بوت).\n\n"
-            "**كيف تستخدمها؟**\n"
-            "• قم بالرد على أي رسالة تريد تثبيتها واكتب: `تثبيت` أو `تثبيت الرسالة`.\n"
-            "• سيقوم الحساب تلقائياً بحذف أمرك وتثبيت الرسالة المطلوبة في المحادثة أو القروب مع إرسال إشعار."
+            "⤾ اوامـر التـثـبيـت 📌\n"
+            "⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆\n\n"
+            "• `.تثبيت`\n"
+            "↞ بالـرد على الرسالة المراد تثبيتها.\n\n"
+            "• `.الغاء التثبيت`\n"
+            "↞ لإلغاء تثبيت الرسالة المثبتة، أو بالرد على رسالة مثبتة لإلغائها.\n\n"
+            "• الاستخدام 💡\n"
+            "↞ اكتب الأوامر بالنقطة فقط. يجب أن يكون حسابك يملك صلاحية تثبيت أو إلغاء تثبيت الرسائل في القروب."
         )
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
 
     elif data == b"enter_code_start":
         user_states[user_id] = {"step": "awaiting_code_input"}
         await event.edit("🎟️ **كود تفعيل التسطير:**\n\nيرجى إرسال كود تفعيل التسطير الآن:", buttons=[[Button.inline("🔙 رجوع", b"main_menu")]])
+
+    elif data == b"enter_all_code_start":
+        user_states[user_id] = {"step": "awaiting_all_code_input"}
+        await event.edit("✨ **كود تفعيل جميع الصلاحيات:**\n\nأرسل الكود الآن لتفعيل التسطير ومميزات السورس معاً:", buttons=[[Button.inline("🔙 رجوع", b"main_menu")]])
 
     elif data == b"enter_source_code_start":
         user_states[user_id] = {"step": "awaiting_source_code_input"}
@@ -3805,6 +5162,17 @@ async def callback_handler(event):
             "يرجى إرسال رقم الهاتف كاملاً مع رمز الدولة (مثال: `+966500000000`):",
             buttons=[[Button.inline("🔙 رجوع", b"main_menu")]]
         )
+    elif data in [b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu"] and user_id in ADMIN_IDS:
+        menu_map = {
+            b"admin_users_menu": ("👥 **قسم المستخدمين**", admin_users_keyboard()),
+            b"admin_admins_menu": ("👑 **قسم المسؤولين**", admin_admins_keyboard()),
+            b"admin_words_menu": ("📝 **قسم إدارة الكلمات والجمل**", admin_words_keyboard()),
+            b"admin_codes_menu": ("🎟️ **قسم أكواد التفعيل**", admin_codes_keyboard()),
+            b"admin_data_menu": ("💾 **قسم إدارة بيانات البوت**", admin_data_keyboard()),
+        }
+        title, buttons = menu_map[data]
+        await event.edit(title, buttons=buttons)
+
     elif data in [b"manual_activate_start", b"extend_subscription_start"] and user_id in ADMIN_IDS:
         mode = "extend" if data == b"extend_subscription_start" else "activate"
         user_states[user_id] = {"step": f"awaiting_{mode}_user_id", "mode": mode}
@@ -3852,15 +5220,32 @@ async def callback_handler(event):
         await event.edit(f"✅ تم {'تمديد' if state.get('mode') == 'extend' else 'تفعيل'} اشتراك المستخدم `{target}` لمدة {days} يوم: {' + '.join(types)}.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
     elif data == b"activation_log_menu" and user_id in ADMIN_IDS:
-        rows = activation_log[-20:][::-1]
-        txt = "📋 **آخر سجل تفعيل:**\n\n" + ("\n".join(f"• {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['time']))} | `{r['user_id']}` | {r['action']} | {r.get('days', 0)} يوم" for r in rows) if rows else "لا يوجد سجل حتى الآن.")
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        rows = activation_log[-30:][::-1]
+        if not rows:
+            txt = "📋 **سجل التفعيل:**\n\nلا يوجد سجل حتى الآن."
+        else:
+            blocks = []
+            for idx, row in enumerate(rows, 1):
+                when = time.strftime('%Y-%m-%d %H:%M', time.localtime(row.get('time', 0)))
+                identity = await format_user_details(row['user_id'])
+                issuer_id = row.get('admin_id')
+                issuer_text = await _issuer_details_text(issuer_id)
+                blocks.append(f"**{idx}.** `{when}`\n{identity}\n• العملية: {row['action']}\n• المدة: `{row.get('days', 0)}` يوم\n👑 **منشئ/منفذ الكود:**\n{issuer_text}")
+            txt = "📋 **سجل التفعيل:**\n\n" + "\n\n".join(blocks)
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
-    elif data == b"expired_today_menu" and user_id in ADMIN_IDS:
-        today = time.strftime('%Y-%m-%d')
-        rows = [r for r in activation_log if r.get('action') == 'انتهاء_اشتراك' and time.strftime('%Y-%m-%d', time.localtime(r['time'])) == today]
-        txt = "⌛ **اشتراكات انتهت اليوم:**\n\n" + ("\n".join(f"• المستخدم: `{r['user_id']}`" for r in rows) if rows else "لا توجد اشتراكات منتهية مسجلة اليوم.")
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+    elif data in [b"expired_today_menu", b"expired_codes_menu"] and user_id in ADMIN_IDS:
+        cutoff = time.time() - (30 * 86400)
+        rows = sorted([row for row in expired_code_history if row.get('time', 0) >= cutoff], key=lambda row: row.get('time', 0), reverse=True)
+        if not rows:
+            txt = "⌛ **الأكواد المنتهية — آخر 30 يوماً:**\n\nلا توجد أكواد منتهية مسجلة خلال آخر 30 يوماً."
+        else:
+            blocks = []
+            for idx, row in enumerate(rows, 1):
+                when = time.strftime('%Y-%m-%d %H:%M', time.localtime(row.get('time', 0)))
+                blocks.append(f"**{idx}.** {row.get('name', 'مستخدم')}\n• الآيدي: `{row.get('user_id')}`\n• اليوزر: {row.get('username', 'ماعنده')}\n• الكود المنتهي: {row.get('subscription_type', 'اشتراك')}\n• انتهى: `{when}`")
+            txt = "⌛ **الأكواد المنتهية — آخر 30 يوماً:**\n\n" + "\n\n".join(blocks)
+        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]], link_preview=False)
 
     elif data == b"voice_menu":
         if not is_source_subscribed(user_id):
@@ -4452,7 +5837,11 @@ async def callback_handler(event):
 
     elif data == b"gen_source_code" and user_id in ADMIN_IDS:
         user_states[user_id] = {"step": "awaiting_source_code_days"}
-        await event.edit("🎟️ **توليد كود مميزات السورس جديد:**\n\nأرسل مدة اشتراك مميزات السورس بالأيام (مثال: `30`):", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        await event.edit("🎟️ **توليد كود مميزات السورس جديد:**\n\nأرسل مدة اشتراك مميزات السورس بالأيام (مثال: `30`):", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
+
+    elif data == b"gen_all_code" and user_id in ADMIN_IDS:
+        user_states[user_id] = {"step": "awaiting_all_code_days"}
+        await event.edit("✨ **توليد كود جميع الصلاحيات:**\n\nأرسل مدة الاشتراك بالأيام. هذا الكود يفعل التسطير ومميزات السورس معاً:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
 
     elif data == b"list_admins" and user_id in ADMIN_IDS:
         await event.edit("جاري تحميل قائمة المسؤولين...")
@@ -4525,11 +5914,20 @@ async def callback_handler(event):
     elif data == b"sessions_menu" and user_id in ADMIN_IDS:
         saved_ids = list_saved_session_ids()
         connected_ids = sorted(user_clients.keys())
-        saved_text = "\n".join(f"• `{uid}`" for uid in saved_ids[:40]) or "لا توجد جلسات محفوظة."
-        connected_text = "\n".join(f"• `{uid}`" for uid in connected_ids[:40]) or "لا توجد جلسات متصلة حالياً."
+        async def _session_rows(ids):
+            if not ids:
+                return "لا توجد حسابات."
+            blocks = []
+            for idx, uid in enumerate(ids[:40], 1):
+                identity = await format_user_details(uid)
+                blocks.append(f"**{idx}.**\n{identity}")
+            return "\n\n".join(blocks)
+        saved_text = await _session_rows(saved_ids)
+        connected_text = await _session_rows(connected_ids)
         await event.edit(
-            f"📱 **إدارة جلسات الحسابات**\n\n🗃️ جلسات محفوظة:\n{saved_text}\n\n🟢 جلسات متصلة الآن:\n{connected_text}",
-            buttons=[[Button.inline("❌ فصل جلسة مستخدم", b"session_disconnect_start")], [Button.inline("🔙 رجوع", b"admin_menu")]]
+            f"📱 **إدارة جلسات الحسابات**\n\n🗃️ **جلسات محفوظة:**\n{saved_text}\n\n🟢 **جلسات متصلة الآن:**\n{connected_text}",
+            buttons=[[Button.inline("❌ فصل جلسة مستخدم", b"session_disconnect_start")], [Button.inline("🔙 رجوع", b"admin_data_menu")]],
+            link_preview=False
         )
 
     elif data == b"session_disconnect_start" and user_id in ADMIN_IDS:
@@ -4538,19 +5936,19 @@ async def callback_handler(event):
 
     elif data == b"admin_error_log_menu" and user_id in ADMIN_IDS:
         if not admin_error_log:
-            await event.edit("✅ لا يوجد أخطاء مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+            await event.edit("✅ لا توجد أخطاء دخول أو تفعيل مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
         else:
             rows = []
-            for item in admin_error_log[-15:][::-1]:
+            for idx, item in enumerate(admin_error_log[-20:][::-1], 1):
                 when = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("time", 0)))
-                rows.append(f"• `{when}` | {item.get('operation')} | مستخدم: `{item.get('user_id') or '- '}`\n  السبب: `{item.get('error')}`")
-            await event.edit("⚠️ **آخر أخطاء النظام:**\n\n" + "\n\n".join(rows), buttons=[[Button.inline("🗑️ مسح سجل الأخطاء", b"admin_error_log_clear")], [Button.inline("🔙 رجوع", b"admin_menu")]])
+                rows.append(f"**{idx}.** `{when}`\n• العملية: {item.get('operation')}\n• الاسم: {item.get('name', 'غير محدد')}\n• الآيدي: `{item.get('user_id') or '-'}`\n• اليوزر: {item.get('username', 'ماعنده')}\n• السبب: `{item.get('error')}`")
+            await event.edit("⚠️ **سجل أخطاء الدخول والتفعيل:**\n\n" + "\n\n".join(rows), buttons=[[Button.inline("🗑️ مسح سجل الأخطاء", b"admin_error_log_clear")], [Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
     elif data == b"admin_error_log_clear" and user_id in ADMIN_IDS:
         admin_error_log.clear()
         save_data()
         await event.answer("✅ تم مسح سجل الأخطاء.", alert=True)
-        await event.edit("✅ لا يوجد أخطاء مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        await event.edit("✅ لا توجد أخطاء دخول أو تفعيل مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
     elif data == b"admin_stats" and user_id in ADMIN_IDS:
         txt = f"📊 **إحصائيات النظام:**\n\n• إجمالي المسجلين: {len(users_db)}\n• عدد المسؤولين: {len(ADMIN_IDS)}\n• الحسابات المتصلة حالياً: {len(user_clients)}\n• المهام الشغالة حالياً: {len(running_tasks)}"
@@ -4595,17 +5993,39 @@ async def inline_source_menu_handler(event):
 # ==================== Text & Media Input Handlers ====================
 @bot.on(events.NewMessage)
 async def message_input_handler(event):
-    global default_tastir, default_fardiyyat, default_reply, activation_codes, source_activation_codes
+    global default_tastir, default_fardiyyat, default_reply, activation_codes, source_activation_codes, all_activation_codes
     if not event.is_private or (event.text and event.text.startswith("/")):
         return
 
     user_id = event.sender_id
+    text = event.raw_text.strip() if event.raw_text else ""
+
+    # التفعيل الفوري في خاص البوت: لا يحتاج المستخدم للضغط على أي زر.
+    # يعالج فقط صيغة أكواد ديمون كي لا يرد على الرسائل العادية.
+    if text and re.fullmatch(r"(?:PBL|SRC|ALL)-[A-Za-z0-9_-]+", text, flags=re.IGNORECASE):
+        code = text.upper()
+        kind, days = await apply_any_activation_code(user_id, code, event)
+        if kind:
+            result = {
+                "tastir": f"✅ تم تفعيل اشتراك التسطير بنجاح لمدة {days} يوم.",
+                "source": f"✅ تم تفعيل مميزات السورس بنجاح لمدة {days} يوم.",
+                "all": f"✅ تم تفعيل جميع الصلاحيات بنجاح لمدة {days} يوم. تم تفعيل التسطير ومميزات السورس معاً.",
+            }[kind]
+            await event.respond(result)
+        else:
+            was_used = any(str(row.get("note", "")).strip() == f"الكود: {code}" for row in activation_log)
+            if was_used:
+                await event.respond("❌ هذا الكود مستخدم مسبقاً.")
+            else:
+                await report_admin_error("كود تفعيل غير صالح", "محاولة كود غير صالح في خاص البوت", user_id)
+                await event.respond("❌ الكود غير صحيح.")
+        return
+
     state = user_states.get(user_id)
     if not state:
         return
 
     step = state.get("step")
-    text = event.raw_text.strip() if event.raw_text else ""
 
     if step == "awaiting_backup_import":
         if user_id not in ADMIN_IDS:
@@ -4787,24 +6207,37 @@ async def message_input_handler(event):
             return
         days = int(text)
         code = "PBL-" + secrets.token_hex(4).upper()
-        activation_codes[code] = days
-        _append_activation_log("توليد_كود_تسطير", user_id, user_id, days, tastir=True)
+        activation_codes[code] = {"days": days, "created_by": user_id}
+        _append_activation_log("توليد_كود_تسطير", user_id, user_id, days, tastir=True, note=f"الكود: {code}")
         save_data()
         user_states.pop(user_id, None)
-        await event.respond(f"✅ **تم توليد كود التسطير بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        await event.respond(f"✅ **تم توليد كود التسطير بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
         return
 
     elif step == "awaiting_source_code_days" and user_id in ADMIN_IDS:
-        if not text.isdigit():
-            await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        if not text.isdigit() or int(text) <= 0:
+            await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
             return
         days = int(text)
         code = "SRC-" + secrets.token_hex(4).upper()
-        source_activation_codes[code] = days
-        _append_activation_log("توليد_كود_سورس", user_id, user_id, days, source=True)
+        source_activation_codes[code] = {"days": days, "created_by": user_id}
+        _append_activation_log("توليد_كود_سورس", user_id, user_id, days, source=True, note=f"الكود: {code}")
         save_data()
         user_states.pop(user_id, None)
-        await event.respond(f"✅ **تم توليد كود مميزات السورس بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        await event.respond(f"✅ **تم توليد كود مميزات السورس بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
+        return
+
+    elif step == "awaiting_all_code_days" and user_id in ADMIN_IDS:
+        if not text.isdigit() or int(text) <= 0:
+            await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
+            return
+        days = int(text)
+        code = "ALL-" + secrets.token_hex(4).upper()
+        all_activation_codes[code] = {"days": days, "created_by": user_id}
+        _append_activation_log("توليد_كود_جميع_الصلاحيات", user_id, user_id, days, tastir=True, source=True, note=f"الكود: {code}")
+        save_data()
+        user_states.pop(user_id, None)
+        await event.respond(f"✅ **تم توليد كود جميع الصلاحيات بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم\n• التفعيل: التسطير + مميزات السورس", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
         return
 
     elif step == "awaiting_add_def_tastir" and user_id in ADMIN_IDS:
@@ -4850,7 +6283,17 @@ async def message_input_handler(event):
         if success:
             await event.respond(f"✅ تم تفعيل مميزات السورس بنجاح لمدة {days} يوم.")
         else:
+            await report_admin_error("كود سورس غير صالح", "محاولة كود سورس غير صالح أو مستخدم", user_id)
             await event.respond("❌ كود تفعيل مميزات السورس غير صالح أو تم استخدامه سابقاً.")
+
+    elif step == "awaiting_all_code_input":
+        success, days = await apply_full_activation_code(user_id, text, event)
+        user_states.pop(user_id, None)
+        if success:
+            await event.respond(f"✅ تم تفعيل كود جميع الصلاحيات بنجاح لمدة {days} يوم. تم تفعيل التسطير ومميزات السورس معاً.")
+        else:
+            await report_admin_error("كود جميع الصلاحيات غير صالح", "محاولة كود جميع الصلاحيات غير صالح أو مستخدم", user_id)
+            await event.respond("❌ كود جميع الصلاحيات غير صالح أو تم استخدامه سابقاً.")
 
     elif step == "awaiting_broadcast_msg" and user_id in ADMIN_IDS:
         user_states.pop(user_id, None)
@@ -4864,7 +6307,11 @@ async def message_input_handler(event):
                 await asyncio.sleep(0.1)
             except Exception:
                 fail_count += 1
-        await msg.edit(f"✅ **تم إكمال الإذاعة بنجاح:**\n\n• تم الإرسال إلى: `{success_count}` مستخدماً\n• فشل الإرسال إلى: `{fail_count}` مستخدماً", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        total_count = success_count + fail_count
+        await msg.edit(
+            f"✅ **تم إكمال الإذاعة العامة:**\n\n• تم الإرسال بنجاح: `{success_count}` مستخدماً\n• فشل الإرسال: `{fail_count}` مستخدماً\n• إجمالي من تمت معالجتهم: `{total_count}` مستخدماً",
+            buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]]
+        )
         return
 
     elif step == "awaiting_revoke_user_id" and user_id in ADMIN_IDS:
@@ -4918,7 +6365,7 @@ async def message_input_handler(event):
         phone = text.replace(" ", "")
         msg = await event.respond("⏳ جاري إرسال كود التحقق...")
         try:
-            client = TelegramClient(f"{SESSIONS_DIR}/user_{user_id}", API_ID, API_HASH)
+            client = TelegramClient(f"{SESSIONS_DIR}/user_{user_id}", API_ID, API_HASH, auto_reconnect=True, connection_retries=None, retry_delay=5)
             await client.connect()
             send_code = await client.send_code_request(phone)
             
@@ -5103,6 +6550,28 @@ async def message_input_handler(event):
         else:
             await event.respond("❌ الأمر غير موجود، تأكد منه ثم أرسله مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
+    elif step == "awaiting_publish_required_add":
+        try:
+            _parse_join_target(text)
+            entries = users_db[user_id].setdefault("publish_required_chats", [])
+            if text not in entries:
+                entries.append(text)
+                save_data()
+            user_states.pop(user_id, None)
+            await event.respond("✅ تم حفظ اشتراك النشر. سيحاول الحساب الانضمام إليه تلقائياً قبل عمليات النشر القادمة.", buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+        except ValueError as e:
+            await event.respond(f"⚠️ {e}", buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+
+    elif step == "awaiting_publish_required_delete":
+        entries = users_db[user_id].setdefault("publish_required_chats", [])
+        if text in entries:
+            entries.remove(text)
+            save_data()
+            user_states.pop(user_id, None)
+            await event.respond("✅ تم حذف اشتراك النشر من القائمة.", buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+        else:
+            await event.respond("⚠️ لم أجد هذا الرابط أو اليوزر في القائمة. أرسله كما ظهر في القائمة.", buttons=[[Button.inline("🔙 رجوع", b"auto_publish_menu")]])
+
     elif step == "awaiting_del_storage_group":
         try:
             gid_to_del = int(text)
@@ -5139,21 +6608,41 @@ async def main():
     
     asyncio.create_task(subscription_maintenance_loop())
 
-    # استرجاع الجلسات المسجلة مسبقاً للمستخدمين وتشغيلها
-    for uid_str, u_data in users_db.items():
+    # نأخذ لقطة ثابتة قبل الاسترجاع، لأن تهيئة الحساب قد تضيف حقولاً إلى users_db.
+    # بذلك لا يتوقف البوت عند وجود أكثر من جلسة محفوظة.
+    saved_user_rows = list(users_db.items())
+    # استرجاع الجلسات والمهام المحفوظة بعد إعادة تشغيل السيرفر، من دون طلب كود دخول جديد.
+    for uid_str, u_data in saved_user_rows:
         uid = int(uid_str)
         session_path = f"{SESSIONS_DIR}/user_{uid}"
         if os.path.exists(f"{session_path}.session"):
             try:
-                client = TelegramClient(session_path, API_ID, API_HASH)
+                client = TelegramClient(session_path, API_ID, API_HASH, auto_reconnect=True, connection_retries=None, retry_delay=5)
                 await client.connect()
                 if await client.is_user_authorized():
                     user_clients[uid] = client
                     await register_userbot_events(client, uid)
                     print(f"Restored userbot session for user {uid}")
+                    await restore_auto_publish_jobs(client, uid)
+                else:
+                    print(f"Session for user {uid} is no longer authorized; login is required once.")
             except Exception as e:
-                print(f"Failed to restore session for {uid}: {e}")
+                print(f"Failed to restore userbot session for {uid}: {e}")
 
+    async def user_connection_guard():
+        """يحاول إعادة الاتصال بالجلسات المحفوظة عند انقطاع الشبكة من دون تسجيل دخول جديد."""
+        while True:
+            for uid, client in list(user_clients.items()):
+                try:
+                    if not client.is_connected():
+                        await client.connect()
+                        if await client.is_user_authorized():
+                            print(f"Reconnected userbot session for user {uid}")
+                except Exception as e:
+                    print(f"Reconnect attempt failed for user {uid}: {e}")
+            await asyncio.sleep(30)
+
+    asyncio.create_task(user_connection_guard())
     print("Bot is running...")
     await bot.run_until_disconnected()
 
