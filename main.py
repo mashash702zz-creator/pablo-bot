@@ -58,8 +58,10 @@ DATA_FILE = os.path.join(PERSISTENT_DIR, "bot_data.json")
 VOICES_DIR = os.path.join(PERSISTENT_DIR, "voices")
 SESSIONS_DIR = os.path.join(PERSISTENT_DIR, "sessions")
 TEMP_DIR = os.path.join(PERSISTENT_DIR, "temp_media")
+# ملفات النسخ تبقى في مجلد مستقل حتى لا تدخل النسخة داخل نفسها عند ضغط الوسائط.
+BACKUP_DIR = os.path.join(PERSISTENT_DIR, "backups")
 
-for _directory in (VOICES_DIR, SESSIONS_DIR, TEMP_DIR):
+for _directory in (VOICES_DIR, SESSIONS_DIR, TEMP_DIR, BACKUP_DIR):
     os.makedirs(_directory, exist_ok=True)
 
 # خريطة السرعة بالثواني
@@ -371,11 +373,109 @@ def _backup_file_path(prefix="backup"):
 
 
 def create_settings_backup():
-    """ينشئ نسخة من الإعدادات والاشتراكات والأكواد فقط، دون ملفات جلسات حساسة."""
+    """نسخة خفيفة متوافقة مع النسخ القديمة من الإعدادات فقط."""
     save_data(force=True)
     output = _backup_file_path("demon_backup")
     shutil.copy2(DATA_FILE, output)
     return output
+
+
+def _archive_directory(archive, directory, prefix, excluded_paths=None):
+    """يضيف ملفات مجلد إلى ZIP مع استثناء ملفات النسخ نفسها."""
+    excluded_paths = {os.path.abspath(item) for item in (excluded_paths or [])}
+    if not os.path.isdir(directory):
+        return
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            source_path = os.path.abspath(os.path.join(root, filename))
+            if source_path in excluded_paths:
+                continue
+            relative_path = os.path.relpath(source_path, directory)
+            archive.write(source_path, os.path.join(prefix, relative_path))
+
+
+def create_full_backup():
+    """ينشئ ملف ZIP واحداً للبيانات والجلسات والوسائط المحلية المحفوظة."""
+    save_data(force=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    output = os.path.join(BACKUP_DIR, f"demon_full_backup_{stamp}.zip")
+    manifest = {
+        "format": "demon_full_backup",
+        "version": 1,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "includes": ["bot_data.json", "sessions", "voices", "temp_media"],
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        archive.writestr("backup_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        if os.path.exists(DATA_FILE):
+            archive.write(DATA_FILE, "bot_data.json")
+        _archive_directory(archive, SESSIONS_DIR, "sessions")
+        _archive_directory(archive, VOICES_DIR, "voices")
+        _archive_directory(archive, TEMP_DIR, "temp_media")
+    return output
+
+
+def _safe_extract_full_backup(archive_path):
+    """يتحقق من ملف النسخة ثم يعيد ملفاتها إلى مجلد التخزين الدائم بأمان."""
+    allowed_roots = {"bot_data.json", "backup_manifest.json", "sessions", "voices", "temp_media"}
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        names = archive.namelist()
+        if "bot_data.json" not in names:
+            raise ValueError("ملف النسخة الموسعة لا يحتوي بيانات البوت.")
+        try:
+            imported_data = json.loads(archive.read("bot_data.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("تعذر قراءة بيانات النسخة الموسعة.") from exc
+        if not isinstance(imported_data, dict) or "users_db" not in imported_data:
+            raise ValueError("بيانات النسخة الموسعة غير صالحة.")
+
+        members = []
+        base = os.path.abspath(PERSISTENT_DIR)
+        for info in archive.infolist():
+            name = info.filename.replace("\\", "/").lstrip("/")
+            if not name or name.endswith("/"):
+                continue
+            root = name.split("/", 1)[0]
+            if root not in allowed_roots:
+                raise ValueError("ملف النسخة يحتوي مساراً غير مسموح.")
+            destination = os.path.abspath(os.path.join(PERSISTENT_DIR, name))
+            if os.path.commonpath([base, destination]) != base:
+                raise ValueError("ملف النسخة يحتوي مساراً غير آمن.")
+            members.append((info, destination))
+
+        # إزالة الملفات السابقة قبل الاستعادة حتى لا تبقى جلسات أو وسائط قديمة غير موجودة في النسخة.
+        for directory in (SESSIONS_DIR, VOICES_DIR, TEMP_DIR):
+            shutil.rmtree(directory, ignore_errors=True)
+            os.makedirs(directory, exist_ok=True)
+        if os.path.exists(DATA_FILE):
+            _safe_remove(DATA_FILE)
+
+        for info, destination in members:
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            with archive.open(info, "r") as source, open(destination, "wb") as target:
+                shutil.copyfileobj(source, target)
+    return imported_data
+
+
+def _rebase_restored_media_paths():
+    """تجعل مسارات الوسائط في البيانات صالحة بعد نقل النسخة إلى جهاز أو سيرفر آخر."""
+    def rebase(value, base_dir):
+        if not value:
+            return value
+        return os.path.join(base_dir, os.path.basename(str(value)))
+
+    for info in users_db.values():
+        if not isinstance(info, dict):
+            continue
+        if info.get("welcome_photo"):
+            info["welcome_photo"] = rebase(info["welcome_photo"], TEMP_DIR)
+        profile_backup = info.get("profile_backup")
+        if isinstance(profile_backup, dict) and profile_backup.get("photo_path"):
+            profile_backup["photo_path"] = rebase(profile_backup["photo_path"], TEMP_DIR)
+        voices = info.get("voices")
+        if isinstance(voices, dict):
+            for number, path in list(voices.items()):
+                voices[number] = rebase(path, VOICES_DIR)
 
 
 async def disconnect_user_session_only(user_id, reason="فصل من لوحة الأدمن"):
@@ -4861,7 +4961,7 @@ def admin_codes_keyboard():
 def admin_data_keyboard(user_id):
     # المسؤول يرى إدارة البيانات ويستعمل أدوات العرض والنسخ؛ تغيير ملكية البوت وصلاحياته للريس فقط.
     buttons = [
-        [Button.inline("💾 إنشاء نسخة احتياطية", b"backup_export")],
+        [Button.inline("💾 إنشاء نسخة احتياطية كاملة", b"backup_export")],
         [Button.inline("📱 إدارة جلسات الحسابات", b"sessions_menu"), Button.inline("⚠️ سجل الأخطاء", b"admin_error_log_menu")],
     ]
     if is_owner(user_id):
@@ -5675,7 +5775,10 @@ async def callback_handler(event):
         user_states[user_id] = {"step": "awaiting_phone"}
         await event.edit(
             "🔑 **تسجيل الدخول / ربط الحساب:**\n\n"
-            "يرجى إرسال رقم الهاتف كاملاً مع رمز الدولة (مثال: `+966500000000`):",
+            "1. أرسل رقم الهاتف كاملاً مع رمز الدولة، مثال: `+966500000000`.\n"
+            "2. سيرسل تليجرام رمز التحقق للحساب؛ أرسله هنا في خاص البوت لإكمال الدخول.\n"
+            "3. إذا كان الحساب محمياً بالتحقق بخطوتين، سيطلب البوت كلمة المرور هنا لإكمال الدخول.\n\n"
+            "🔒 الرمز وكلمة المرور يستخدمان لإتمام الدخول فقط ولا يحفظهما البوت.",
             buttons=[[Button.inline("🔙 رجوع", b"main_menu")]]
         )
     elif data in [b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu"] and is_staff(user_id):
@@ -6683,15 +6786,29 @@ async def callback_handler(event):
 
     elif data == b"backup_export" and (is_owner(user_id) or is_responsible(user_id)):
         try:
-            backup_path = create_settings_backup()
-            await bot.send_file(user_id, backup_path, caption="💾 نسخة احتياطية للإعدادات والاشتراكات والأكواد. لا تتضمن ملفات الجلسات الحساسة.")
+            backup_path = create_full_backup()
+            await bot.send_file(
+                user_id,
+                backup_path,
+                caption=(
+                    "💾 نسخة احتياطية كاملة لبوت ديمون.\n\n"
+                    "تشمل: البيانات والاشتراكات والأكواد والإعدادات، جلسات الحسابات، "
+                    "الصوتيات والوسائط المحلية المحفوظة.\n"
+                    "⚠️ الملف يحتوي جلسات حساسة؛ احتفظ به لنفسك ولا ترسله لأي شخص."
+                ),
+            )
         except Exception as e:
-            await report_admin_error("إنشاء نسخة احتياطية", e, user_id)
-            await event.answer("❌ تعذر إنشاء النسخة الاحتياطية.", alert=True)
+            await report_admin_error("إنشاء نسخة احتياطية كاملة", e, user_id)
+            await event.answer("❌ تعذر إنشاء النسخة الاحتياطية الكاملة.", alert=True)
 
     elif data == b"backup_import_start" and is_owner(user_id):
         user_states[user_id] = {"step": "awaiting_backup_import"}
-        await event.edit("📥 أرسل الآن ملف النسخة الاحتياطية بصيغة JSON. سيتم حفظ نسخة تلقائية من البيانات الحالية قبل الاستيراد.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+        await event.edit(
+            "📥 أرسل الآن ملف النسخة الاحتياطية الكاملة بصيغة ZIP.\n\n"
+            "ستُستعاد البيانات والجلسات والصوتيات والوسائط المحلية، وسيُحفظ ملف كامل من الوضع الحالي قبل الاستيراد.\n"
+            "⚠️ لا تستورد إلا نسخة موثوقة أنشأها بوتك.",
+            buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]],
+        )
 
     elif data == b"sessions_menu" and (is_owner(user_id) or is_responsible(user_id)):
         saved_ids = list_saved_session_ids()
@@ -6892,32 +7009,41 @@ async def message_input_handler(event):
             user_states.pop(user_id, None)
             return
         if not event.document:
-            await event.respond("⚠️ أرسل ملف JSON للنسخة الاحتياطية.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+            await event.respond("⚠️ أرسل ملف ZIP للنسخة الاحتياطية الكاملة.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             return
         imported_path = None
+        restore_copy = None
         try:
             imported_path = await event.download_media(file=TEMP_DIR)
-            with open(imported_path, "r", encoding="utf-8") as handle:
-                imported = json.load(handle)
-            if not isinstance(imported, dict) or "users_db" not in imported:
-                raise ValueError("ملف النسخة الاحتياطية غير صالح.")
-            current_backup = create_settings_backup()
-            with open(DATA_FILE, "w", encoding="utf-8") as handle:
-                json.dump(imported, handle, ensure_ascii=False, indent=4)
+            if not str(imported_path).lower().endswith(".zip"):
+                raise ValueError("أرسل ملف ZIP الذي أنشأه زر النسخة الاحتياطية الكاملة.")
+            # تبقى نسخة الإدخال خارج مجلد الوسائط لأن الاستيراد يمسح الوسائط القديمة قبل استعادتها.
+            restore_copy = os.path.join(BACKUP_DIR, f"restore_input_{secrets.token_urlsafe(8)}.zip")
+            shutil.copy2(imported_path, restore_copy)
+            current_backup = create_full_backup()
             for session_client in list(user_clients.values()):
                 try:
                     await session_client.disconnect()
                 except Exception:
                     pass
             user_clients.clear()
+            _safe_extract_full_backup(restore_copy)
             load_data()
+            _rebase_restored_media_paths()
+            save_data(force=True)
             user_states.pop(user_id, None)
-            await event.respond(f"✅ تم استيراد النسخة الاحتياطية بنجاح. تم حفظ نسخة من البيانات السابقة في: `{os.path.basename(current_backup)}`", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
+            await event.respond(
+                "✅ تم استيراد النسخة الاحتياطية الكاملة بنجاح.\n\n"
+                "تمت استعادة البيانات والجلسات والوسائط المحلية. أعد تشغيل البوت مرة واحدة لتوصيل كل الجلسات المستعادة.\n"
+                f"📦 تم حفظ نسخة كاملة من الوضع السابق في: `{os.path.basename(current_backup)}`",
+                buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]],
+            )
         except Exception as e:
-            await report_admin_error("استيراد نسخة احتياطية", e, user_id)
+            await report_admin_error("استيراد نسخة احتياطية كاملة", e, user_id)
             await event.respond(f"❌ تعذر استيراد النسخة: `{e}`", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
         finally:
             _safe_remove(imported_path)
+            _safe_remove(restore_copy)
         return
 
     elif step == "awaiting_disconnect_session_id":
