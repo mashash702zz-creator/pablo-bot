@@ -48,6 +48,7 @@ ADMIN_IDS = [520859814]
 # رابط المطور وقناة البوت
 DEV_URL = "https://t.me/Nardouv"
 CHANNEL_URL = "https://t.me/PabloBot666"
+DEVELOPERS = [{"username": "Nardouv"}]
 
 # ملفات البيانات والجلسات. عيّن PERSISTENT_DATA_DIR لمسار القرص الدائم في السيرفر.
 # إذا لم يضبط المتغير، تعمل الملفات محلياً في مجلد المشروع كالمعتاد.
@@ -95,6 +96,8 @@ default_reply = []
 
 # المهام النشطة
 running_tasks = {}
+# رموز مؤقتة لعرض تفاصيل عمليات قسم التسطير عبر الأزرار التفاعلية.
+tastir_operation_views = {}
 auto_publish_tasks = {}
 auto_publish_meta = {}
 broadcast_tasks = {}
@@ -114,6 +117,85 @@ _pending_save_handle = None
 # جلسة مستقلة للبوت؛ تمنع استخدام جلسة حساب شخصي قديمة بدل بوت الإدارة.
 bot = TelegramClient("manager_bot_8617294862", API_ID, API_HASH)
 
+# المالك الرئيسي ثابت ولا يمكن أن يفقد صلاحية إدارة البوت من البيانات المحفوظة.
+OWNER_ID = 520859814
+RESPONSIBLE_IDS = []
+navigation_history = {}
+
+
+def is_owner(user_id):
+    return int(user_id) == OWNER_ID
+
+
+def is_responsible(user_id):
+    return int(user_id) in RESPONSIBLE_IDS
+
+
+def is_staff(user_id):
+    return is_owner(user_id) or is_responsible(user_id) or int(user_id) in ADMIN_IDS
+
+
+def track_menu_navigation(user_id, callback_data):
+    """يحفظ المسار الحالي للقوائم ليتوافق الرجوع مع القسم السابق."""
+    menu_callbacks = {
+        b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"nick_am_menu", b"speed_menu",
+        b"source_features_menu", b"flush_section", b"flush_menu", b"mute_menu", b"voice_menu", b"clone_menu", b"welcome_menu",
+        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu",
+        b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu",
+    }
+    if callback_data == b"main_menu":
+        return
+    if callback_data not in menu_callbacks:
+        return
+    stack = navigation_history.setdefault(int(user_id), [])
+    if callback_data in stack:
+        while stack and stack[-1] != callback_data:
+            stack.pop()
+    else:
+        stack.append(callback_data)
+    del stack[:-16]
+
+
+OWNER_ONLY_CALLBACKS = {
+    b"add_admin_start", b"delete_admin_start",
+    b"backup_export", b"backup_import_start", b"sessions_menu", b"session_disconnect_start",
+    b"admin_error_log_menu", b"admin_error_log_clear", b"change_channel_start",
+    b"manage_developers_menu", b"add_developer_start", b"add_responsible_start", b"delete_responsible_start",
+    b"list_admins",
+}
+
+
+
+def normalize_telegram_username(value):
+    raw = str(value or "").strip()
+    raw = raw.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "")
+    username = raw.lstrip("@").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    return username
+
+
+def developer_url(item):
+    username = normalize_telegram_username(item.get("username", "")) if isinstance(item, dict) else None
+    return f"https://t.me/{username}" if username else DEV_URL
+
+
+def developer_main_buttons():
+    """يرتب أزرار الاتصال: الريس يميناً والقناة يساراً، ثم المطورون والقناة أسفلهم عند الإضافة."""
+    visible = DEVELOPERS[:3] or [{"username": "Nardouv"}]
+    owner_button = Button.url("👑 الريس", developer_url(visible[0]))
+    channel_button = Button.url("📢 قناة البوت", CHANNEL_URL)
+    if len(visible) == 1:
+        # ترتيب الزرين هنا: القناة يسار والريس يمين.
+        return [[channel_button, owner_button]]
+
+    rows = [[owner_button, Button.url("👨‍💻 المطور 2", developer_url(visible[1]))]]
+    if len(visible) >= 3:
+        rows.append([Button.url("👨‍💻 المطور 3", developer_url(visible[2]))])
+    rows.append([channel_button])
+    return rows
+
+
 # ==================== Persistence Functions ====================
 def _build_data_snapshot():
     return {
@@ -127,7 +209,10 @@ def _build_data_snapshot():
         "activation_log": activation_log[-500:],
         "admin_error_log": admin_error_log[-200:],
         "expired_code_history": expired_code_history[-500:],
-        "admin_ids": ADMIN_IDS
+        "admin_ids": ADMIN_IDS,
+        "responsible_ids": RESPONSIBLE_IDS,
+        "channel_url": CHANNEL_URL,
+        "developers": DEVELOPERS
     }
 
 
@@ -171,7 +256,7 @@ def save_data(force=False):
     _pending_save_handle = loop.call_later(0.20, _flush_scheduled_save)
 
 def load_data():
-    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, all_activation_codes, activation_log, admin_error_log, expired_code_history, ADMIN_IDS
+    global default_tastir, default_fardiyyat, default_reply, users_db, activation_codes, source_activation_codes, all_activation_codes, activation_log, admin_error_log, expired_code_history, ADMIN_IDS, RESPONSIBLE_IDS, CHANNEL_URL, DEV_URL, DEVELOPERS
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -190,6 +275,20 @@ def load_data():
                 loaded_admins = data.get("admin_ids", None)
                 if loaded_admins:
                     ADMIN_IDS = [int(a) for a in loaded_admins]
+                RESPONSIBLE_IDS = [int(value) for value in data.get("responsible_ids", []) if str(value).lstrip("-").isdigit()]
+                saved_channel = str(data.get("channel_url", "")).strip()
+                if saved_channel.startswith(("https://t.me/", "http://t.me/")):
+                    CHANNEL_URL = saved_channel
+                saved_developers = data.get("developers", [])
+                if isinstance(saved_developers, list):
+                    normalized_developers = []
+                    for item in saved_developers:
+                        username = normalize_telegram_username(item.get("username", "") if isinstance(item, dict) else item)
+                        if username and username.lower() not in [entry["username"].lower() for entry in normalized_developers]:
+                            normalized_developers.append({"username": username})
+                    if normalized_developers:
+                        DEVELOPERS = normalized_developers
+                        DEV_URL = developer_url(DEVELOPERS[0])
         except Exception as e:
             print(f"Error loading data: {e}")
 
@@ -197,7 +296,7 @@ load_data()
 
 # ==================== Helper Functions ====================
 def is_subscribed(user_id):
-    if user_id in ADMIN_IDS:
+    if is_staff(user_id):
         return True
     user_info = users_db.get(user_id)
     if not user_info:
@@ -205,7 +304,7 @@ def is_subscribed(user_id):
     return time.time() < user_info.get("expires_at", 0)
 
 def is_source_subscribed(user_id):
-    if user_id in ADMIN_IDS:
+    if is_staff(user_id):
         return True
     user_info = users_db.get(user_id)
     if not user_info:
@@ -375,7 +474,7 @@ def _remember_expired_code_user(user_id, info, subscription_type="جميع ال�
 
 async def remove_user_completely(user_id, reason="حذف"):
     """يحذف المستخدم المنتهي/الملغى من القائمة ويفصل جلسة حسابه ومهامه."""
-    if user_id in ADMIN_IDS:
+    if is_staff(user_id):
         return False
     stop_running_task(user_id)
     client = user_clients.pop(user_id, None)
@@ -459,21 +558,30 @@ def init_user_db(user_id):
     if user_id not in users_db:
         users_db[user_id] = {}
     u = users_db[user_id]
-    u.setdefault("expires_at", time.time() + (100 * 365 * 86400) if user_id in ADMIN_IDS else 0)
-    u.setdefault("source_expires_at", time.time() + (100 * 365 * 86400) if user_id in ADMIN_IDS else 0)
+    u.setdefault("expires_at", time.time() + (100 * 365 * 86400) if is_staff(user_id) else 0)
+    u.setdefault("source_expires_at", time.time() + (100 * 365 * 86400) if is_staff(user_id) else 0)
     u.setdefault("tastir", [])
     u.setdefault("fardiyyat", [])
     u.setdefault("reply", [])
+    u.setdefault("nick_am", [])
     u.pop("bot_responses", None)
     u.setdefault("voices", {})
     u.setdefault("include_tastir_in_reply", True)
     u.setdefault("include_fardiyyat_in_reply", True)
+    u.setdefault("include_tastir_in_nick_am", True)
+    u.setdefault("include_fardiyyat_in_nick_am", True)
+    u.setdefault("nick_am_enabled", False)
+    u.setdefault("nick_am_reply_enabled", True)
     u.setdefault("tastir_start_cmds", ["تسطير"])
     u.setdefault("tastir_stop_cmds", ["ايقاف التسطير"])
     u.setdefault("fardiyyat_start_cmds", ["فرديات"])
     u.setdefault("fardiyyat_stop_cmds", ["ايقاف الفرديات"])
     u.setdefault("reply_start_cmds", ["ريبلاي"])
     u.setdefault("reply_stop_cmds", ["ايقاف الريبلاي"])
+    # تشغيل نيك ام ثابت، بينما أوامر الإيقاف يحددها المستخدم.
+    u.pop("nick_am_start_cmds", None)
+    u.pop("del_nick_am_start", None)
+    u.setdefault("nick_am_stop_cmds", ["ايقاف نيك ام"])
     u.setdefault("mute_cmds", ["اص"])
     u.setdefault("unmute_cmds", ["اتكلم", "إلغاء الكتم", "الغاء الكتم"])
     u.setdefault("purge_cmds", ["مسح"])
@@ -485,12 +593,14 @@ def init_user_db(user_id):
     u["fardiyyat_stop_cmds"] = normalize_command_list(u.get("fardiyyat_stop_cmds"), ["ايقاف الفرديات"])
     u["reply_start_cmds"] = normalize_command_list(u.get("reply_start_cmds"), ["ريبلاي"])
     u["reply_stop_cmds"] = normalize_command_list(u.get("reply_stop_cmds"), ["ايقاف الريبلاي"])
+    u["nick_am_stop_cmds"] = normalize_command_list(u.get("nick_am_stop_cmds"), ["ايقاف نيك ام"])
     u.setdefault("del_tastir_start", True)
     u.setdefault("del_tastir_stop", True)
     u.setdefault("del_fardiyyat_start", True)
     u.setdefault("del_fardiyyat_stop", True)
     u.setdefault("del_reply_start", True)
     u.setdefault("del_reply_stop", True)
+    u.setdefault("del_nick_am_stop", True)
     u.setdefault("del_mute_cmd", True)
     u.setdefault("del_unmute_cmd", True)
     u.setdefault("del_voice_cmd", True)
@@ -651,9 +761,10 @@ async def apply_full_activation_code(user_id, code, event):
 
 
 async def search_and_download_youtube(query):
+    cache_key = " ".join(str(query or "").strip().casefold().split())
     def download():
-        if query in search_cache:
-            video_info = search_cache[query]
+        if cache_key in search_cache:
+            video_info = search_cache[cache_key]
             vid = video_info.get('id')
             title = video_info.get('title', 'Audio')
             duration = int(video_info.get('duration', 0))
@@ -672,9 +783,16 @@ async def search_and_download_youtube(query):
         ydl_opts = {
             'format': 'bestaudio/best',
             'default_search': 'ytsearch1',
-            'socket_timeout': 10,
+            'socket_timeout': 12,
+            'retries': 2,
+            'fragment_retries': 2,
+            'extractor_retries': 2,
+            'concurrent_fragment_downloads': 4,
+            'http_chunk_size': 10 * 1024 * 1024,
+            'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
+            'noprogress': True,
             'writethumbnail': True,
             'extractor_args': {
                 'youtube': {
@@ -697,7 +815,10 @@ async def search_and_download_youtube(query):
             else:
                 video_info = info
             
-            search_cache[query] = video_info
+            search_cache[cache_key] = video_info
+            if len(search_cache) > 120:
+                # نبقي الذاكرة خفيفة مع الاستفادة من أحدث نتائج البحث.
+                search_cache.pop(next(iter(search_cache)), None)
             
             vid = video_info.get('id')
             title = video_info.get('title', 'Audio')
@@ -725,7 +846,11 @@ async def search_and_download_youtube(query):
 def stop_running_task(owner_id, chat_id=None, target_user_id=None, mode=None):
     keys_to_remove = []
     for key, info in list(running_tasks.items()):
-        k_owner, k_chat, k_target, k_mode = key
+        # العملية تحمل معرفاً فريداً في آخر المفتاح، لذلك تستخدم بيانات المهمة للفلترة.
+        k_owner = info.get("owner_id")
+        k_chat = info.get("chat_id")
+        k_target = info.get("target_user_id")
+        k_mode = info.get("mode")
         if k_owner == owner_id:
             chat_match = (chat_id is None) or (k_chat == chat_id)
             target_match = (target_user_id is None) or (k_target == target_user_id)
@@ -738,16 +863,131 @@ def stop_running_task(owner_id, chat_id=None, target_user_id=None, mode=None):
         if info and info.get("task") and not info["task"].done():
             info["task"].cancel()
 
-def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, target_user_id=None):
+TASTIR_OPERATION_MODES = {"tastir", "fardiyyat", "reply", "nick_am"}
+
+
+def get_tastir_section_tasks(owner_id):
+    """يعيد مهام قسم التسطير فقط، مرتبة بحسب وقت بدء التشغيل."""
+    result = []
+    for key, info in list(running_tasks.items()):
+        if info.get("owner_id") == owner_id and info.get("mode") in TASTIR_OPERATION_MODES:
+            result.append((key, info))
+    return sorted(result, key=lambda item: item[1].get("started_at", 0), reverse=True)
+
+
+def stop_tastir_section_tasks(owner_id):
+    """يوقف التسطير والفرديات والريبلاي ونيك ام فقط، ولا يلمس أي ميزة أخرى."""
+    keys = [key for key, info in list(running_tasks.items())
+            if info.get("owner_id") == owner_id and info.get("mode") in TASTIR_OPERATION_MODES]
+    for key in keys:
+        info = running_tasks.pop(key, None)
+        task = info.get("task") if info else None
+        if task and not task.done():
+            task.cancel()
+    return len(keys)
+
+
+def tastir_operation_title(mode):
+    return {
+        "tastir": "التسطير",
+        "fardiyyat": "الفرديات",
+        "reply": "الريبلاي",
+        "nick_am": "نيك ام",
+    }.get(mode, "عملية")
+
+
+def format_tastir_elapsed(started_at):
+    if not started_at:
+        return "غير متاح"
+    seconds = max(0, int(time.time() - started_at))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} ساعة")
+    if minutes or not parts:
+        parts.append(f"{minutes} دقيقة")
+    if seconds and not hours:
+        parts.append(f"{seconds} ثانية")
+    return " و ".join(parts)
+
+
+async def format_tastir_operation_location(owner_id, info):
+    """يعرض مكان العملية برابط قابل للفتح، ويستعمل حساب المستخدم للوصول إلى القروبات الخاصة."""
+    chat_id = info.get("chat_id")
+    target_user_id = info.get("target_user_id")
+    client = user_clients.get(owner_id)
+
+    if chat_id and int(chat_id) > 0:
+        person_id = target_user_id or chat_id
+        name = "مستخدم"
+        username = None
+        if client:
+            try:
+                entity = await client.get_entity(person_id)
+                name = " ".join(part for part in [getattr(entity, "first_name", None), getattr(entity, "last_name", None)] if part) or "مستخدم"
+                username = getattr(entity, "username", None)
+            except Exception:
+                pass
+        person_link = f"tg://openmessage?user_id={person_id}"
+        username_text = f"@{username}" if username else "لا يملك يوزر"
+        return (
+            "👤 **المكان:** محادثة خاصة\n"
+            f"• الشخص: [{name}]({person_link})\n"
+            f"• اليوزر: {username_text}\n"
+            f"• الآيدي: `{person_id}`"
+        )
+
+    chat_name = "قروب أو قناة"
+    username = None
+    if client:
+        try:
+            entity = await client.get_entity(chat_id)
+            chat_name = getattr(entity, "title", None) or "قروب أو قناة"
+            username = getattr(entity, "username", None)
+        except Exception:
+            pass
+    chat_link = f"https://t.me/{username}" if username else f"tg://openmessage?chat_id={chat_id}"
+    return (
+        "👥 **المكان:** قروب أو قناة\n"
+        f"• القروب/القناة: [{chat_name}]({chat_link})\n"
+        f"• الآيدي: `{chat_id}`"
+    )
+
+
+def register_tastir_operation_view(owner_id, task_key):
+    """معرف قصير خاص بصاحب العملية حتى تبقى بيانات أزرار تيليجرام ضمن الحد المسموح."""
+    now = time.time()
+    for token, details in list(tastir_operation_views.items()):
+        if details.get("expires_at", 0) < now:
+            tastir_operation_views.pop(token, None)
+    token = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    while token in tastir_operation_views:
+        token = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    tastir_operation_views[token] = {
+        "owner_id": owner_id,
+        "task_key": task_key,
+        "expires_at": now + 3600,
+    }
+    return token
+
+def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, target_user_id=None, nick_prefix=None, nick_target_style="plain"):
     # لا نشغّل حلقة فارغة: الجمل يجب أن تكون التي أضافها المستخدم أو الجمل الأساسية التي حفظها الأدمن.
     current_info = users_db.get(owner_id, {})
     if mode == "tastir" and not (current_info.get("tastir", []) or default_tastir):
         return False
     if mode == "fardiyyat" and not (current_info.get("fardiyyat", []) or default_fardiyyat):
         return False
+    if mode == "nick_am":
+        nick_has_private = bool(current_info.get("nick_am", []))
+        nick_has_tastir = current_info.get("include_tastir_in_nick_am", True) and (current_info.get("tastir", []) or default_tastir)
+        nick_has_fardiyyat = current_info.get("include_fardiyyat_in_nick_am", True) and (current_info.get("fardiyyat", []) or default_fardiyyat)
+        if not (nick_has_private or nick_has_tastir or nick_has_fardiyyat):
+            return False
 
-    task_key = (owner_id, chat_id, target_user_id, mode)
-    stop_running_task(owner_id, chat_id, target_user_id=target_user_id, mode=mode)
+    # كل تشغيل يأخذ مفتاحاً مستقلاً حتى يبقى أكثر من تسطير/فرديات/نيك ام شغالاً في المكان نفسه.
+    operation_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+    task_key = (owner_id, chat_id, target_user_id, mode, operation_id)
 
     running_tasks[task_key] = {
         "task": None,
@@ -755,12 +995,24 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
         "chat_id": chat_id,
         "mode": mode,
         "target_msg_id": target_msg_id,
-        "target_user_id": target_user_id
+        "target_user_id": target_user_id,
+        "nick_prefix": str(nick_prefix or "").strip(),
+        "nick_target_style": str(nick_target_style or "plain"),
+        "nick_reply_last_msg_id": None,
+        "nick_reply_sent_without_message": False,
+        "operation_id": operation_id,
+        "started_at": time.time(),
     }
 
     async def loop():
         try:
+            # تعتمد السرعة على بداية كل دورة وليس على وقت انتهاء طلب الإرسال،
+            # لذلك لا يُضاف زمن الشبكة إلى السرعة المختارة عندما يكون الإرسال أسرع منها.
+            next_send_at = time.monotonic()
             while True:
+                wait_seconds = next_send_at - time.monotonic()
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
                 task_info = running_tasks.get(task_key)
                 if not task_info or task_info.get("mode") != mode:
                     break
@@ -774,19 +1026,51 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                     phrases = user_info.get("tastir", []) + default_tastir
                 elif mode == "fardiyyat":
                     phrases = user_info.get("fardiyyat", []) + default_fardiyyat
+                elif mode == "nick_am":
+                    phrases = list(user_info.get("nick_am", []))
+                    if user_info.get("include_tastir_in_nick_am", True):
+                        phrases += user_info.get("tastir", []) + default_tastir
+                    if user_info.get("include_fardiyyat_in_nick_am", True):
+                        phrases += user_info.get("fardiyyat", []) + default_fardiyyat
                 else:
                     phrases = []
 
                 curr_target_msg_id = task_info.get("target_msg_id")
                 target_uid = task_info.get("target_user_id")
                 
+                # كريبلاي نيك ام يرسل مرة واحدة ثم ينتظر رسالة جديدة من الشخص نفسه.
+                nick_as_reply = mode == "nick_am" and user_info.get("nick_am_reply_enabled", True)
+                nick_target_style = task_info.get("nick_target_style", "plain")
+                if nick_as_reply:
+                    last_replied_id = task_info.get("nick_reply_last_msg_id")
+                    sent_without_message = task_info.get("nick_reply_sent_without_message", False)
+                    if curr_target_msg_id and curr_target_msg_id == last_replied_id:
+                        next_send_at = time.monotonic() + 0.15
+                        await asyncio.sleep(0.15)
+                        continue
+                    if not curr_target_msg_id and sent_without_message:
+                        next_send_at = time.monotonic() + 0.15
+                        await asyncio.sleep(0.15)
+                        continue
+
                 if phrases:
                     phrase = random.choice(phrases)
+                    final_text = phrase
+                    if mode == "nick_am":
+                        prefix = str(task_info.get("nick_prefix") or "").strip()
+                        if not prefix:
+                            break
+                        final_text = f"{prefix} {phrase}"
                     sent = False
-                    
-                    if curr_target_msg_id:
+                    # نيك ام يحتفظ دائماً بآخر رسالة للشخص، لكن اختيار المستخدم يحدد
+                    # إن كانت الرسالة تُربط بها كريبلاي أم ترسل متتابعة من دون ربط.
+                    send_as_reply = user_info.get("nick_am_reply_enabled", True)
+                    # الرد الذي بدأ عليه نيك ام يبقى رداً حتى لو كان تكرار الريبلاي معطلاً.
+                    should_reply = mode != "nick_am" or (nick_target_style == "reply") or (send_as_reply and bool(curr_target_msg_id))
+
+                    if should_reply and curr_target_msg_id:
                         try:
-                            await client.send_message(chat_id, phrase, reply_to=curr_target_msg_id)
+                            await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id)
                             sent = True
                         except Exception:
                             if target_uid:
@@ -794,20 +1078,20 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                                     async for msg in client.iter_messages(chat_id, from_user=target_uid, limit=1):
                                         task_info["target_msg_id"] = msg.id
                                         curr_target_msg_id = msg.id
-                                        await client.send_message(chat_id, phrase, reply_to=curr_target_msg_id)
+                                        await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id)
                                         sent = True
                                         break
                                 except Exception:
                                     pass
-                    
+
                     if not sent:
-                        final_text = phrase
-                        if target_uid and chat_id != target_uid:
+                        # المنشن الصريح يبقى موجوداً في كلا النمطين؛ أما الرد فيستخدم سهم الرد.
+                        if target_uid and chat_id != target_uid and (mode != "nick_am" or nick_target_style == "mention" or send_as_reply):
                             try:
                                 user_entity = await client.get_entity(target_uid)
                                 u_name = user_entity.first_name or "مستخدم"
                                 mention = f"@{user_entity.username}" if user_entity.username else f"[{u_name}](tg://openmessage?user_id={target_uid})"
-                                final_text = f"{phrase} {mention}"
+                                final_text = f"{final_text} {mention}"
                             except Exception:
                                 pass
                         
@@ -816,13 +1100,30 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                             sent = True
                         except Exception:
                             pass
-                
-                delay = user_info.get("speed", 1.0)
-                await asyncio.sleep(delay)
+
+                    if sent and mode == "nick_am" and send_as_reply:
+                        if curr_target_msg_id:
+                            task_info["nick_reply_last_msg_id"] = curr_target_msg_id
+                        else:
+                            task_info["nick_reply_sent_without_message"] = True
+
+                try:
+                    delay = max(0.1, float(user_info.get("speed", 1.0)))
+                except (TypeError, ValueError):
+                    delay = 1.0
+                next_send_at += delay
+                # عندما يستغرق إرسال تيليجرام وقتاً أطول من السرعة المختارة،
+                # لا يمكن إرسال رسالة بأثر رجعي؛ تبدأ الدورة التالية فور الجاهزية.
+                if next_send_at < time.monotonic():
+                    next_send_at = time.monotonic()
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
+        finally:
+            current_info = running_tasks.get(task_key)
+            if current_info and current_info.get("task") is asyncio.current_task():
+                running_tasks.pop(task_key, None)
 
     print(f"[TASK STARTED] mode={mode} owner={owner_id} chat={chat_id} target={target_user_id}")
     task = asyncio.create_task(loop())
@@ -850,6 +1151,28 @@ async def resolve_target_user(event):
         except Exception:
             return event.chat_id
     return None
+
+
+
+async def resolve_nick_am_launch(event, nick_prefix, target_msg_id, target_user_id):
+    """يفصل كلمة نيك ام عن هدف التشغيل: الرد يحتفظ بالرد، والمنشن يحتفظ بالمنشن."""
+    prefix = str(nick_prefix or "").strip()
+    target_style = "reply" if target_msg_id else ("reply" if event.is_private else "plain")
+
+    # في القروب يمكن وضع اليوزر في آخر الأمر: نيك ام الرياض @username.
+    if not target_msg_id and prefix:
+        parts = prefix.rsplit(maxsplit=1)
+        candidate = parts[-1] if parts else ""
+        if candidate.startswith("@") and len(candidate) > 1:
+            try:
+                entity = await event.client.get_entity(candidate)
+                target_user_id = entity.id
+                prefix = parts[0].strip() if len(parts) > 1 else ""
+                target_style = "mention"
+            except Exception:
+                pass
+
+    return prefix, target_msg_id, target_user_id, target_style
 
 async def check_user_ban_permissions(client, chat_entity, user):
     """يتحقق من صلاحية الحظر الفعلية من صلاحيات العضو، للقروب والقناة."""
@@ -1304,20 +1627,28 @@ def _publish_job_list(owner_id):
     return users_db[owner_id].setdefault("auto_publish_jobs", [])
 
 
-def _remove_persisted_publish_job(owner_id, target_chat_id):
+def _remove_persisted_publish_job(owner_id, target_chat_id, operation_id=None):
     target = int(target_chat_id)
     jobs = _publish_job_list(owner_id)
-    users_db[owner_id]["auto_publish_jobs"] = [job for job in jobs if int(job.get("target_chat_id", 0)) != target]
+    if operation_id is None:
+        users_db[owner_id]["auto_publish_jobs"] = [job for job in jobs if int(job.get("target_chat_id", 0)) != target]
+    else:
+        users_db[owner_id]["auto_publish_jobs"] = [
+            job for job in jobs
+            if not (int(job.get("target_chat_id", 0)) == target and str(job.get("operation_id", "")) == str(operation_id))
+        ]
     save_data()
 
 
-def _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed=0, origin_chat_id=None):
+def _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed=0, origin_chat_id=None, operation_id=None):
     target = int(target_chat_id)
     source_chat_id = getattr(source_message, "chat_id", None)
     source_message_id = getattr(source_message, "id", None)
     if source_chat_id is None or source_message_id is None:
         raise ValueError("تعذر حفظ مصدر رسالة النشر لاستعادتها لاحقاً.")
+    operation_id = str(operation_id or secrets.token_urlsafe(6).replace("-", "x").replace("_", "y"))
     job = {
+        "operation_id": operation_id,
         "target_chat_id": target,
         "source_chat_id": int(source_chat_id),
         "source_message_id": int(source_message_id),
@@ -1328,17 +1659,20 @@ def _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, dela
         "origin_chat_id": int(origin_chat_id) if origin_chat_id is not None else int(source_chat_id),
         "updated_at": int(time.time()),
     }
-    jobs = [item for item in _publish_job_list(owner_id) if int(item.get("target_chat_id", 0)) != target]
+    jobs = [item for item in _publish_job_list(owner_id)
+            if str(item.get("operation_id", "")) != operation_id]
     jobs.append(job)
     users_db[owner_id]["auto_publish_jobs"] = jobs
     save_data()
     return job
 
 
-def _update_publish_completed(owner_id, target_chat_id, completed):
+def _update_publish_completed(owner_id, target_chat_id, completed, operation_id=None):
     target = int(target_chat_id)
     for job in _publish_job_list(owner_id):
-        if int(job.get("target_chat_id", 0)) == target:
+        same_target = int(job.get("target_chat_id", 0)) == target
+        same_operation = operation_id is None or str(job.get("operation_id", "")) == str(operation_id)
+        if same_target and same_operation:
             job["completed"] = int(completed)
             job["updated_at"] = int(time.time())
             save_data()
@@ -1347,8 +1681,6 @@ def _update_publish_completed(owner_id, target_chat_id, completed):
 
 def _translate_publish_error(error):
     raw = str(error or "").strip()
-    if raw.startswith("تحويل الوسائط مقيّد"):
-        return raw
     normalized = raw.upper()
     if "YOU CAN'T WRITE IN THIS CHAT" in normalized or "CHAT_WRITE_FORBIDDEN" in normalized:
         return "تم تقييدك من الكتابة في هذا القروب أو القناة."
@@ -1359,7 +1691,7 @@ def _translate_publish_error(error):
     if "CHAT_ADMIN_REQUIRED" in normalized or "RIGHTS_NOT_AVAILABLE" in normalized:
         return "لا تملك الصلاحية اللازمة للنشر هنا."
     if "PROTECTED CHAT" in normalized or "FORWARDS_RESTRICTED" in normalized or ("FORWARD" in normalized and "RESTRICT" in normalized):
-        return "رفض تيليجرام التحويل لهذه الرسالة؛ جرّب التحويل اليدوي من الحساب للتأكد من صلاحية المصدر والوجهة."
+        return "رفض تيليجرام التحويل في المحاولة النظامية؛ يظهر تفصيل الطلبين في سجل الخطأ للإدارة."
     if "MESSAGE_ID_INVALID" in normalized:
         return "تعذر الوصول إلى رسالة المصدر للتحويل؛ أعد الرد على الرسالة ثم شغّل النشر من جديد."
     if "CHANNEL_PRIVATE" in normalized or "CHAT_PRIVATE" in normalized:
@@ -1389,11 +1721,18 @@ def _is_transient_publish_error(error):
     return any(marker in normalized for marker in transient_markers)
 
 
+async def _forward_original_publish_message(client, target_chat_id, source_message):
+    """تحويل نظامي مباشر للرسالة الأصلية بلا فحص محتوى أو تقييد محلي."""
+    if source_message is None:
+        raise ValueError("تعذر العثور على الرسالة الأصلية للتحويل.")
+    # هذه نفس عملية تحويل رسالة تيليجرام من المصدر إلى الوجهة، ولا توجد أي شروط محلية قبلها.
+    await client.forward_messages(target_chat_id, source_message)
+
+
 async def _publish_message(client, target_chat_id, source_message, forward_mode=False):
     """ينشر نسخة بلا مصدر افتراضياً، أو تحويلاً مباشراً طبيعياً عند كتابة «تحويل»."""
     if forward_mode:
-        # نفس واجهة Telethon المباشرة: تمرير الرسالة الأصلية للوجهة كما في التحويل الطبيعي للحساب.
-        await client.forward_messages(target_chat_id, source_message)
+        await _forward_original_publish_message(client, target_chat_id, source_message)
         return
 
     text = getattr(source_message, "message", None) or ""
@@ -1650,12 +1989,10 @@ async def check_publish_permission(client, target_chat_id, owner_id=None):
         return False, str(target_chat_id), _translate_publish_error(e)
 
 
-async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False, completed=0, origin_chat_id=None, restored=False, pending_approval_targets=None):
-    task_key = (owner_id, int(target_chat_id))
-    old_task = auto_publish_tasks.get(task_key)
-    if old_task and not old_task.done():
-        await stop_auto_publish_task(client, owner_id, target_chat_id, "تم استبدال عملية النشر بعملية جديدة")
-    job = _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed, origin_chat_id)
+async def start_auto_publish_task(client, owner_id, target_chat_id, source_message, delay, count, forward_mode=False, completed=0, origin_chat_id=None, restored=False, pending_approval_targets=None, operation_id=None):
+    operation_id = str(operation_id or secrets.token_urlsafe(6).replace("-", "x").replace("_", "y"))
+    task_key = (owner_id, int(target_chat_id), operation_id)
+    job = _upsert_persisted_publish_job(owner_id, target_chat_id, source_message, delay, count, forward_mode, completed, origin_chat_id, operation_id)
 
     async def publish_loop():
         sent = int(job.get("completed", 0))
@@ -1711,21 +2048,21 @@ async def start_auto_publish_task(client, owner_id, target_chat_id, source_messa
                 active_pending_approval_targets.clear()
                 approval_wait_notice_sent = False
                 sent += 1
-                _update_publish_completed(owner_id, target_chat_id, sent)
+                _update_publish_completed(owner_id, target_chat_id, sent, operation_id)
                 if sent < count:
                     await asyncio.sleep(delay)
         except asyncio.CancelledError:
             reason = publish_stop_reasons.pop(task_key, "تم إيقاف النشر يدوياً")
-            _remove_persisted_publish_job(owner_id, target_chat_id)
+            _remove_persisted_publish_job(owner_id, target_chat_id, operation_id)
             await _send_publish_stop_notice(owner_id, target_name, target_chat_id, reason)
             raise
         except Exception as e:
             print(f"[PUBLISH ERROR] owner={owner_id} target={target_chat_id} type={type(e).__name__} raw={e}")
             await report_admin_error("توقف النشر التلقائي", e, owner_id, target_chat_id)
-            _remove_persisted_publish_job(owner_id, target_chat_id)
+            _remove_persisted_publish_job(owner_id, target_chat_id, operation_id)
             await _send_publish_stop_notice(owner_id, target_name, target_chat_id, _translate_publish_error(e))
         else:
-            _remove_persisted_publish_job(owner_id, target_chat_id)
+            _remove_persisted_publish_job(owner_id, target_chat_id, operation_id)
             try:
                 await bot.send_message(owner_id, f"✅ اكتمل النشر في **{target_name}** بعد إرسال {sent} رسالة.")
             except Exception:
@@ -1750,7 +2087,7 @@ async def start_auto_publish_task(client, owner_id, target_chat_id, source_messa
 async def stop_auto_publish_task(client, owner_id, target_chat_id=None, reason="تم إيقاف النشر يدوياً"):
     stopped = 0
     for key, task in list(auto_publish_tasks.items()):
-        task_owner, task_chat = key
+        task_owner, task_chat = key[0], key[1]
         if task_owner == owner_id and (target_chat_id is None or task_chat == int(target_chat_id)):
             if not task.done():
                 publish_stop_reasons[key] = reason
@@ -1766,7 +2103,9 @@ async def restore_auto_publish_jobs(client, owner_id):
         target_chat_id = int(job.get("target_chat_id", 0))
         if not target_chat_id:
             continue
-        task_key = (owner_id, target_chat_id)
+        operation_id = str(job.get("operation_id") or secrets.token_urlsafe(6).replace("-", "x").replace("_", "y"))
+        job["operation_id"] = operation_id
+        task_key = (owner_id, target_chat_id, operation_id)
         if task_key in auto_publish_tasks and not auto_publish_tasks[task_key].done():
             continue
         try:
@@ -1777,7 +2116,7 @@ async def restore_auto_publish_jobs(client, owner_id):
                 client, owner_id, target_chat_id, source_message,
                 float(job.get("delay", 1.0)), int(job.get("count", 1)),
                 bool(job.get("forward_mode", False)), int(job.get("completed", 0)),
-                job.get("origin_chat_id"), restored=True,
+                job.get("origin_chat_id"), restored=True, operation_id=operation_id,
             )
         except Exception as e:
             _remove_persisted_publish_job(owner_id, target_chat_id)
@@ -2419,11 +2758,18 @@ async def _ytdlp_download(url, audio_only=False):
         "outtmpl": template,
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
-        "format": "bestaudio/best" if audio_only else "best[ext=mp4]/best",
+        "socket_timeout": 12,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 2,
+        "concurrent_fragment_downloads": 4,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "format": "bestaudio/best" if audio_only else "best[height<=720][ext=mp4]/best[height<=720]/best",
     }
     if audio_only:
-        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}]
     loop = asyncio.get_running_loop()
 
     def worker():
@@ -2716,14 +3062,17 @@ async def register_userbot_events(client_inst, owner_id):
             command_reply_to = event.reply_to_msg_id
 
             async def command_reply(message, **kwargs):
+                # تستخدم النتائج المهمة هذا الخيار لتبقى في المحادثة بدلاً من الحذف المؤقت.
+                keep_result = bool(kwargs.pop("keep_result", False))
                 if command_reply_to and "reply_to" not in kwargs:
                     kwargs["reply_to"] = command_reply_to
                 sent_message = await client_inst.send_message(chat_id, message, **kwargs)
-                # لا تحذف القوائم والأزرار أو رسائل التقدم حتى تبقى قابلة للاستخدام والتحديث.
+                # لا تحذف القوائم والأزرار أو رسائل التقدم، ولا نتائج الترجمة والتحويل النهائية.
                 message_text = str(message or "")
                 is_progress = message_text.startswith(("⏳", "🔍", "⚡", "📊"))
-                if not kwargs.get("buttons") and not is_progress:
-                    raw_command = (event.raw_text or "").lstrip(".").strip().split()
+                raw_command = (event.raw_text or "").lstrip(".").strip().split()
+                translation_result = bool(raw_command and raw_command[0] in TRANSLATION_COMMANDS)
+                if not keep_result and not translation_result and not kwargs.get("buttons") and not is_progress:
                     action_commands = {"انتحال", "كشف", "ايدي", "رابط", "الانشاء", "تثبيت", "الغاء", "إلغاء", "كتم"}
                     wait_seconds = 10 if command_reply_to or (raw_command and raw_command[0] in action_commands) else 4
                     asyncio.create_task(delete_message_after(sent_message, wait_seconds))
@@ -2776,6 +3125,7 @@ async def register_userbot_events(client_inst, owner_id):
             f_stop = user_info.get("fardiyyat_stop_cmds", [])
             r_start = user_info.get("reply_start_cmds", [])
             r_stop = user_info.get("reply_stop_cmds", [])
+            n_stop = user_info.get("nick_am_stop_cmds", [])
             m_cmds = user_info.get("mute_cmds", [])
             um_cmds = user_info.get("unmute_cmds", [])
             p_cmds = user_info.get("purge_cmds", [])
@@ -2805,6 +3155,7 @@ async def register_userbot_events(client_inst, owner_id):
             f_stop = normalize_command_list(f_stop, [])
             r_start = normalize_command_list(r_start, [])
             r_stop = normalize_command_list(r_stop, [])
+            n_stop = normalize_command_list(n_stop, [])
             m_cmds = normalize_command_list(m_cmds, [])
             um_cmds = normalize_command_list(um_cmds, [])
 
@@ -2817,6 +3168,26 @@ async def register_userbot_events(client_inst, owner_id):
                 legacy_reply = await event.get_reply_message()
                 if legacy_reply:
                     legacy_target_user_id = legacy_reply.sender_id
+
+            nick_am_command = "نيك ام" if (legacy_text == "نيك ام" or legacy_text.startswith("نيك ام ")) else None
+            if nick_am_command:
+                # عند التعطيل نتجاهل العبارة بصمت حتى لا تتداخل مع الحديث العادي.
+                if not user_info.get("nick_am_enabled", False):
+                    return
+                nick_prefix = legacy_text[len(nick_am_command):].strip()
+                nick_prefix, nick_target_msg_id, nick_target_user_id, nick_target_style = await resolve_nick_am_launch(
+                    event, nick_prefix, legacy_target_msg_id, legacy_target_user_id
+                )
+                if not nick_prefix:
+                    await command_reply("⚠️ يجب كتابة اسم بعد أمر نيك ام.")
+                    return
+                started = start_running_task(
+                    client_inst, owner_id, chat_id, "nick_am", nick_target_msg_id,
+                    nick_target_user_id, nick_prefix=nick_prefix, nick_target_style=nick_target_style,
+                )
+                if not started:
+                    await command_reply("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
+                return
 
             if legacy_text in t_start:
                 if user_info.get("del_tastir_start", True):
@@ -2852,8 +3223,9 @@ async def register_userbot_events(client_inst, owner_id):
                 if not (user_info.get("reply", []) or default_reply or user_info.get("tastir", []) or default_tastir or user_info.get("fardiyyat", []) or default_fardiyyat):
                     await command_reply( "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
                     return
-                task_key = (owner_id, chat_id, legacy_target_user_id, "reply")
-                running_tasks[task_key] = {"task": None, "owner_id": owner_id, "chat_id": chat_id, "target_user_id": legacy_target_user_id, "mode": "reply", "target_msg_id": legacy_target_msg_id}
+                operation_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
+                task_key = (owner_id, chat_id, legacy_target_user_id, "reply", operation_id)
+                running_tasks[task_key] = {"task": None, "owner_id": owner_id, "chat_id": chat_id, "target_user_id": legacy_target_user_id, "mode": "reply", "target_msg_id": legacy_target_msg_id, "operation_id": operation_id, "started_at": time.time()}
                 return
 
             if legacy_text in t_stop:
@@ -2872,6 +3244,15 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                 stop_running_task(owner_id, chat_id, target_user_id=legacy_target_user_id, mode="fardiyyat")
+                return
+
+            if legacy_text in n_stop:
+                if user_info.get("del_nick_am_stop", True):
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                stop_running_task(owner_id, chat_id, target_user_id=legacy_target_user_id, mode="nick_am")
                 return
 
             if legacy_text in r_stop:
@@ -3118,7 +3499,9 @@ async def register_userbot_events(client_inst, owner_id):
                     await event.delete()
                 except Exception:
                     pass
-                jobs = [job for job in users_db.get(owner_id, {}).get("auto_publish_jobs", []) if (owner_id, int(job.get("target_chat_id", 0))) in auto_publish_tasks]
+                active_publish_keys = {(key[1], str(key[2])) for key, task in auto_publish_tasks.items() if not task.done()}
+                jobs = [job for job in users_db.get(owner_id, {}).get("auto_publish_jobs", [])
+                        if (int(job.get("target_chat_id", 0)), str(job.get("operation_id", ""))) in active_publish_keys]
                 rows = []
                 for job in jobs:
                     target_id = int(job.get("target_chat_id", 0))
@@ -3254,7 +3637,7 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                     # النتيجة فقط، من دون عنوان أو توجيهات أو رسائل خطأ ظاهرة للمستخدم.
-                    await command_reply( translated_value)
+                    await command_reply(translated_value, keep_result=True)
                 except Exception:
                     pass
                 return
@@ -3759,6 +4142,26 @@ async def register_userbot_events(client_inst, owner_id):
             f_stop = normalize_command_list(f_stop, ["ايقاف الفرديات"])
             r_start = normalize_command_list(r_start, ["ريبلاي"])
             r_stop = normalize_command_list(r_stop, ["ايقاف الريبلاي"])
+            n_stop = normalize_command_list(user_info.get("nick_am_stop_cmds", []), ["ايقاف نيك ام"])
+
+            nick_am_command = "نيك ام" if (text == "نيك ام" or text.startswith("نيك ام ")) else None
+            if nick_am_command:
+                if not user_info.get("nick_am_enabled", False):
+                    return
+                nick_prefix = text[len(nick_am_command):].strip()
+                nick_prefix, nick_target_msg_id, nick_target_user_id, nick_target_style = await resolve_nick_am_launch(
+                    event, nick_prefix, target_msg_id, target_user_id
+                )
+                if not nick_prefix:
+                    await command_reply("⚠️ يجب كتابة اسم بعد أمر نيك ام.")
+                    return
+                started = start_running_task(
+                    client_inst, owner_id, chat_id, "nick_am", nick_target_msg_id,
+                    nick_target_user_id, nick_prefix=nick_prefix, nick_target_style=nick_target_style,
+                )
+                if not started:
+                    await command_reply("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
+                return
 
             if text in t_start:
                 if user_info.get("del_tastir_start", True):
@@ -3801,7 +4204,8 @@ async def register_userbot_events(client_inst, owner_id):
                     "chat_id": chat_id,
                     "target_user_id": target_user_id,
                     "mode": "reply",
-                    "target_msg_id": target_msg_id
+                    "target_msg_id": target_msg_id,
+                    "started_at": time.time()
                 }
                 return
 
@@ -3821,6 +4225,15 @@ async def register_userbot_events(client_inst, owner_id):
                     except Exception:
                         pass
                 stop_running_task(owner_id, chat_id, target_user_id=target_user_id, mode="fardiyyat")
+                return
+
+            elif text in n_stop:
+                if user_info.get("del_nick_am_stop", True):
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                stop_running_task(owner_id, chat_id, target_user_id=target_user_id, mode="nick_am")
                 return
 
             elif text in r_stop:
@@ -3930,7 +4343,8 @@ async def register_userbot_events(client_inst, owner_id):
                                 )
                                 await client_inst.send_message(storage_group_id, private_notice, parse_mode="md")
                                 storage_active_sources[owner_id] = source_key
-                            # رسالة الخاص تتحول دائماً، لكن بطاقة التنبيه لا تتكرر لنفس المصدر.
+                            # رسالة الخاص تتحول دائماً مع الصورة أو الوسيط والنص المرافق.
+                            # والوسائط المؤقتة نحاول حفظها فور وصول الحدث قبل أن تنتهي صلاحيتها.
                             try:
                                 await client_inst.forward_messages(storage_group_id, event.message)
                             except Exception:
@@ -3953,10 +4367,10 @@ async def register_userbot_events(client_inst, owner_id):
                                 internal_chat_id = str(chat_id).replace("-100", "")
                                 msg_link = f"https://t.me/c/{internal_chat_id}/{event.id}"
 
-                            # القروبات: نرسل بطاقة التاك فقط، ولا نُحوّل رسالة الشخص أو وسائطه نهائياً.
+                            # القروبات: بطاقة التاك عند تغير المصدر، ثم تحويل رسالة الشخص نفسها
+                            # بالوسيط والنص المرافق حتى تصل مجموعة التخزين الرسالة كاملة.
                             if show_notice_card:
                                 message_text = event.raw_text or ("رسالة تحتوي على وسائط" if has_media else "رسالة بدون نص")
-                                media_note = "\n\n📎 **الرسالة تحتوي على وسائط (لا يتم تحويل وسائط القروبات).**" if has_media else ""
                                 group_notice = (
                                     "#تـنـبـيـه_تــاك\n\n"
                                     "◂ **المجمـوعـة :**\n"
@@ -3967,10 +4381,24 @@ async def register_userbot_events(client_inst, owner_id):
                                     f"- الايدي : `{sender_id}`\n"
                                     f"- اليـوزر : {sender_username}\n\n"
                                     f"◂ **الرسالـة :** {message_text}\n\n"
-                                    f"◂ **الرابـط :** [اضغـط هـنـا]({msg_link}){media_note}"
+                                    f"◂ **الرابـط :** [اضغـط هـنـا]({msg_link})"
                                 )
                                 await client_inst.send_message(storage_group_id, group_notice, link_preview=False, parse_mode="md")
                                 storage_active_sources[owner_id] = source_key
+                            try:
+                                # التحويل يحتفظ بالنص وبالوسيط كما أرسله صاحب التاك.
+                                await client_inst.forward_messages(storage_group_id, event.message)
+                            except Exception:
+                                # عند تعذر التحويل، نحفظ الوسيط مباشرة مع النص إن كان متاحاً.
+                                if has_media:
+                                    stored_path = await client_inst.download_media(event.message, file=TEMP_DIR)
+                                    if stored_path:
+                                        try:
+                                            await client_inst.send_file(storage_group_id, stored_path, caption=event.raw_text or "")
+                                        finally:
+                                            _safe_remove(stored_path)
+                                elif event.raw_text:
+                                    await client_inst.send_message(storage_group_id, event.raw_text)
                     except Exception as e:
                         print(f"Storage group alert error: {e}")
             # ------------------------------------------------
@@ -3986,8 +4414,10 @@ async def register_userbot_events(client_inst, owner_id):
             for key, info in list(running_tasks.items()):
                 if info.get("owner_id") == owner_id and info.get("chat_id") == chat_id and info.get("target_user_id") == sender_id:
                     info["target_msg_id"] = event.id
-            reply_key = (owner_id, chat_id, sender_id, "reply")
-            if reply_key in running_tasks:
+            reply_tasks = [info for info in running_tasks.values()
+                           if info.get("owner_id") == owner_id and info.get("chat_id") == chat_id
+                           and info.get("target_user_id") == sender_id and info.get("mode") == "reply"]
+            if reply_tasks:
                 if is_subscribed(owner_id):
                     phrases = list(user_info.get("reply", []) + default_reply)
                     
@@ -4025,17 +4455,55 @@ def main_menu_keyboard(user_id):
             buttons.append([Button.inline("⭐ مميزات السورس", b"source_features_menu")])
         buttons.append([Button.inline("📊 حالة الاشتراكات", b"sub_info")])
 
-    if user_id in ADMIN_IDS:
+    if is_staff(user_id):
         buttons.append([Button.inline("👑 لوحة تحكم المسؤول", b"admin_menu")])
-    buttons.append([Button.url("📢 قناة البوت", CHANNEL_URL), Button.url("👨‍💻 المطور", DEV_URL)])
+    buttons.extend(developer_main_buttons())
     return buttons
 
 
 def tastir_section_keyboard(user_id):
     return [
         [Button.inline("📝 التسطير", b"tastir_menu"), Button.inline("🎯 الفرديات", b"fardiyyat_menu")],
-        [Button.inline("💬 الريبلاي", b"reply_menu"), Button.inline("⚡ السرعة", b"speed_menu")],
+        [Button.inline("💬 الريبلاي", b"reply_menu"), Button.inline("🏷️ نيك ام", b"nick_am_menu")],
+        [Button.inline("⚡ السرعة", b"speed_menu")],
+        [Button.inline("🛑 إيقاف العمليات", b"tastir_ops_menu")],
         [Button.inline("🔙 رجوع", b"main_menu")]
+    ]
+
+def nick_am_menu_keyboard(user_id):
+    u = users_db.get(user_id, {})
+    enabled = bool(u.get("nick_am_enabled", False))
+    status = "مفعل ✅" if enabled else "معطل ❌"
+    activation_button = [Button.inline(f"🔘 تفعيل نيك ام [{status}]", b"toggle_nick_am")]
+    if not enabled:
+        return [
+            activation_button,
+            [Button.inline("🔙 رجوع إلى قسم التسطير", b"tastir_section")],
+        ]
+
+    stop_delete = "✅" if u.get("del_nick_am_stop", True) else "❌"
+    tastir_include = "✅" if u.get("include_tastir_in_nick_am", True) else "❌"
+    fardiyyat_include = "✅" if u.get("include_fardiyyat_in_nick_am", True) else "❌"
+    reply_status = "مفعل ✅" if u.get("nick_am_reply_enabled", True) else "غير مفعل ❌"
+    return [
+        activation_button,
+        [Button.inline(f"💬 إرسال الرسائل كريبلاي [{reply_status}]", b"toggle_nick_am_reply")],
+        [Button.inline("➕ إضافة نصوص نيك ام", b"add_nick_am"), Button.inline("📋 عرض النصوص", b"show_nick_am")],
+        [Button.inline(f"📝 تضمين التسطير بالنيك ام [{tastir_include}]", b"tog_nick_am_tastir")],
+        [Button.inline(f"🎯 تضمين الفرديات بالنيك ام [{fardiyyat_include}]", b"tog_nick_am_fardiyyat")],
+        [Button.inline("⏹️ إضافة أمر إيقاف", b"add_nick_am_stop"), Button.inline("📜 أوامر الإيقاف", b"show_nick_am_stop")],
+        [Button.inline(f"🗑️ مسح أمر الإيقاف [{stop_delete}]", b"tog_nick_am_stop")],
+        [Button.inline("❌ خيارات حذف نصوص نيك ام", b"del_nick_am_sub")],
+        [Button.inline("❌ حذف أوامر الإيقاف", b"clear_nick_am_stop")],
+        [Button.inline("🔙 رجوع إلى قسم التسطير", b"tastir_section")],
+    ]
+
+
+def tastir_operations_menu_keyboard():
+    return [
+        [Button.inline("🛑 إيقاف جميع العمليات", b"tastir_ops_stop_all")],
+        [Button.inline("📋 إيقاف عملية", b"tastir_ops_list")],
+        [Button.inline("🔙 رجوع إلى قسم التسطير", b"tastir_section")],
     ]
 
 def flush_section_keyboard():
@@ -4271,7 +4739,7 @@ def tastir_menu_keyboard(user_id):
         [Button.inline(f"🗑️ مسح أمر التشغيل [{t_st}]", b"tog_tastir_start"), Button.inline(f"🗑️ مسح أمر الإيقاف [{t_sp}]", b"tog_tastir_stop")],
         [Button.inline("❌ خيارات حذف جمل التسطير", b"del_tastir_sub")],
         [Button.inline("❌ حذف أوامر التشغيل", b"clear_tastir_start"), Button.inline("❌ حذف أوامر الإيقاف", b"clear_tastir_stop")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"tastir_section")]
     ]
 
 def fardiyyat_menu_keyboard(user_id):
@@ -4285,7 +4753,7 @@ def fardiyyat_menu_keyboard(user_id):
         [Button.inline(f"🗑️ مسح أمر التشغيل [{f_st}]", b"tog_fardiyyat_start"), Button.inline(f"🗑️ مسح أمر الإيقاف [{f_sp}]", b"tog_fardiyyat_stop")],
         [Button.inline("❌ خيارات حذف الفرديات", b"del_fardiyyat_sub")],
         [Button.inline("❌ حذف أوامر التشغيل", b"clear_fardiyyat_start"), Button.inline("❌ حذف أوامر الإيقاف", b"clear_fardiyyat_stop")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"tastir_section")]
     ]
 
 def reply_menu_keyboard(user_id):
@@ -4303,7 +4771,7 @@ def reply_menu_keyboard(user_id):
         [Button.inline(f"🗑️ مسح أمر التشغيل [{r_st}]", b"tog_reply_start"), Button.inline(f"🗑️ مسح أمر الإيقاف [{r_sp}]", b"tog_reply_stop")],
         [Button.inline("❌ خيارات حذف جمل الريبلاي", b"del_reply_sub")],
         [Button.inline("❌ حذف أوامر التشغيل", b"clear_reply_start"), Button.inline("❌ حذف أوامر الإيقاف", b"clear_reply_stop")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"tastir_section")]
     ]
 
 def mute_menu_keyboard(user_id):
@@ -4328,17 +4796,20 @@ def speed_menu_keyboard():
         [Button.inline("⏱️ 6 ثانية", b"spd_6"), Button.inline("⏱️ 7 ثانية", b"spd_7")],
         [Button.inline("⏱️ 8 ثانية", b"spd_8"), Button.inline("⏱️ 9 ثانية", b"spd_9")],
         [Button.inline("⏱️ 10 ثانية", b"spd_10")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
+        [Button.inline("🔙 رجوع", b"tastir_section")]
     ]
 
-def admin_menu_keyboard():
-    return [
-        [Button.inline("👥 قسم المستخدمين", b"admin_users_menu"), Button.inline("👑 قسم المسؤولين", b"admin_admins_menu")],
+def admin_menu_keyboard(user_id):
+    buttons = [
+        [Button.inline("👥 قسم المستخدمين", b"admin_users_menu")],
         [Button.inline("📝 إدارة الكلمات والجمل", b"admin_words_menu"), Button.inline("🎟️ أكواد التفعيل", b"admin_codes_menu")],
-        [Button.inline("💾 إدارة بيانات البوت", b"admin_data_menu")],
         [Button.inline("📢 إذاعة عامة", b"broadcast_start"), Button.inline("📊 إحصائيات النظام", b"admin_stats")],
-        [Button.inline("🔙 رجوع", b"main_menu")]
     ]
+    if is_owner(user_id) or is_responsible(user_id):
+        buttons.insert(1, [Button.inline("👑 قسم المسؤولين", b"admin_admins_menu")])
+        buttons.insert(3, [Button.inline("💾 إدارة بيانات البوت", b"admin_data_menu")])
+    buttons.append([Button.inline("🔙 رجوع", b"main_menu")])
+    return buttons
 
 
 def admin_users_keyboard():
@@ -4350,12 +4821,16 @@ def admin_users_keyboard():
     ]
 
 
-def admin_admins_keyboard():
-    return [
-        [Button.inline("👥 قائمة المسؤولين", b"list_admins")],
-        [Button.inline("➕ إضافة مسؤول", b"add_admin_start"), Button.inline("❌ حذف مسؤول", b"delete_admin_start")],
-        [Button.inline("◀️ رجوع", b"admin_menu")]
-    ]
+def admin_admins_keyboard(user_id):
+    buttons = [[Button.inline("🔎 كشف قائمة المسؤولين", b"list_responsibles")]]
+    if is_owner(user_id):
+        buttons.extend([
+            [Button.inline("⭐ رفع مسؤول", b"add_responsible_start"), Button.inline("❌ حذف مسؤول", b"delete_responsible_start")],
+            [Button.inline("👥 قائمة الإدارة", b"list_admins")],
+            [Button.inline("➕ إضافة أدمن", b"add_admin_start"), Button.inline("❌ حذف أدمن", b"delete_admin_start")],
+        ])
+    buttons.append([Button.inline("◀️ رجوع", b"admin_menu")])
+    return buttons
 
 
 def admin_words_keyboard():
@@ -4375,12 +4850,18 @@ def admin_codes_keyboard():
     ]
 
 
-def admin_data_keyboard():
-    return [
-        [Button.inline("💾 إنشاء نسخة احتياطية", b"backup_export"), Button.inline("📥 استيراد نسخة احتياطية", b"backup_import_start")],
+def admin_data_keyboard(user_id):
+    # المسؤول يرى إدارة البيانات ويستعمل أدوات العرض والنسخ؛ تغيير ملكية البوت وصلاحياته للريس فقط.
+    buttons = [
+        [Button.inline("💾 إنشاء نسخة احتياطية", b"backup_export")],
         [Button.inline("📱 إدارة جلسات الحسابات", b"sessions_menu"), Button.inline("⚠️ سجل الأخطاء", b"admin_error_log_menu")],
-        [Button.inline("◀️ رجوع", b"admin_menu")]
     ]
+    if is_owner(user_id):
+        buttons.insert(0, [Button.inline("📢 تغيير قناة البوت", b"change_channel_start")])
+        buttons.insert(1, [Button.inline("👨‍💻 المطورين", b"manage_developers_menu")])
+        buttons[2].append(Button.inline("📥 استيراد نسخة احتياطية", b"backup_import_start"))
+    buttons.append([Button.inline("◀️ رجوع", b"admin_menu")])
+    return buttons
 
 
 def manual_subscription_keyboard(state):
@@ -4398,14 +4879,14 @@ def admin_tastir_menu_keyboard():
     return [
         [Button.inline("➕ إضافة تسطير أساسي", b"add_def_tastir"), Button.inline("📋 عرض التسطير الأساسي", b"show_def_tastir")],
         [Button.inline("🗑️ حذف جملة أساسية محددة", b"del_def_tastir_item_start"), Button.inline("⚠️ حذف جميع التسطير الأساسي", b"clear_def_tastir")],
-        [Button.inline("🔙 رجوع للوحة الأدمن", b"admin_menu")]
+        [Button.inline("🔙 رجوع", b"admin_words_menu")]
     ]
 
 def admin_fardiyyat_menu_keyboard():
     return [
         [Button.inline("➕ إضافة فرديات أساسية", b"add_def_fardiyyat"), Button.inline("📋 عرض الفرديات الأساسية", b"show_def_fardiyyat")],
         [Button.inline("🗑️ حذف كلمة أساسية محددة", b"del_def_fardiyyat_item_start"), Button.inline("⚠️ حذف جميع الفرديات الأساسية", b"clear_def_fardiyyat")],
-        [Button.inline("🔙 رجوع للوحة الأدمن", b"admin_menu")]
+        [Button.inline("🔙 رجوع", b"admin_words_menu")]
     ]
 
 # ==================== Bot Event Handlers ====================
@@ -4443,10 +4924,26 @@ async def start_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    global default_tastir, default_fardiyyat, default_reply
+    global default_tastir, default_fardiyyat, default_reply, CHANNEL_URL, DEV_URL
     user_id = event.sender_id
     data = event.data
     init_user_db(user_id)
+    track_menu_navigation(user_id, data)
+    if data in OWNER_ONLY_CALLBACKS and not is_owner(user_id):
+        await event.answer("⚠️ تعذر الوصول: هذه الإدارة مخصصة للريس فقط.", alert=True)
+        return
+
+    fast_menu_callbacks = {
+        b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"nick_am_menu", b"speed_menu",
+        b"source_features_menu", b"flush_section", b"flush_menu", b"mute_menu", b"voice_menu", b"clone_menu", b"welcome_menu",
+        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"section_account", b"section_publish", b"section_download", b"section_tools",
+        b"youtube_menu", b"tiktok_menu", b"instagram_menu", b"pinterest_menu", b"story_menu", b"github_menu", b"writing_menu",
+    }
+    if data in fast_menu_callbacks:
+        try:
+            await event.answer()
+        except Exception:
+            pass
 
     if data in [b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"flush_section", b"flush_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu", b"clone_menu", b"welcome_menu", b"auto_publish_menu", b"conversion_menu", b"id_menu"]:
         user_states.pop(user_id, None)
@@ -4462,6 +4959,15 @@ async def callback_handler(event):
         except MessageNotModifiedError:
             await event.answer()
         return
+
+    if data == b"main_menu":
+        # الأزرار القديمة التي كانت تعيد للرئيسية تستعمل الآن آخر قائمة فعلية كخطوة رجوع واحدة.
+        stack = navigation_history.get(int(user_id), [])
+        if len(stack) > 1:
+            stack.pop()
+            data = stack[-1]
+        else:
+            navigation_history.pop(int(user_id), None)
 
     if data == b"main_menu":
         me = await bot.get_me()
@@ -4847,7 +5353,9 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        jobs = [job for job in users_db.get(user_id, {}).get("auto_publish_jobs", []) if (user_id, int(job.get("target_chat_id", 0))) in auto_publish_tasks]
+        active_publish_keys = {(key[1], str(key[2])) for key, task in auto_publish_tasks.items() if not task.done()}
+        jobs = [job for job in users_db.get(user_id, {}).get("auto_publish_jobs", [])
+                if (int(job.get("target_chat_id", 0)), str(job.get("operation_id", ""))) in active_publish_keys]
         client = user_clients.get(user_id)
         rows = []
         for job in jobs:
@@ -5140,7 +5648,7 @@ async def callback_handler(event):
         await event.edit("🎟️ **إدخال كود تفعيل مميزات السورس:**\n\nيرجى إرسال كود تفعيل مميزات السورس الآن:", buttons=[[Button.inline("🔙 رجوع", b"main_menu")]])
 
     elif data == b"sub_info":
-        if user_id in ADMIN_IDS:
+        if is_staff(user_id):
             txt = "📝 **اشتراك التسطير:** مفعل بنمط مسؤول 👑 (غير محدود)\n⭐ **مميزات السورس:** مفعل 👑 (غير محدود)"
         else:
             exp = users_db[user_id]["expires_at"]
@@ -5162,24 +5670,24 @@ async def callback_handler(event):
             "يرجى إرسال رقم الهاتف كاملاً مع رمز الدولة (مثال: `+966500000000`):",
             buttons=[[Button.inline("🔙 رجوع", b"main_menu")]]
         )
-    elif data in [b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu"] and user_id in ADMIN_IDS:
+    elif data in [b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu"] and is_staff(user_id):
         menu_map = {
             b"admin_users_menu": ("👥 **قسم المستخدمين**", admin_users_keyboard()),
-            b"admin_admins_menu": ("👑 **قسم المسؤولين**", admin_admins_keyboard()),
+            b"admin_admins_menu": ("👑 **قسم المسؤولين**", admin_admins_keyboard(user_id)),
             b"admin_words_menu": ("📝 **قسم إدارة الكلمات والجمل**", admin_words_keyboard()),
             b"admin_codes_menu": ("🎟️ **قسم أكواد التفعيل**", admin_codes_keyboard()),
-            b"admin_data_menu": ("💾 **قسم إدارة بيانات البوت**", admin_data_keyboard()),
+            b"admin_data_menu": ("💾 **قسم إدارة بيانات البوت**", admin_data_keyboard(user_id)),
         }
         title, buttons = menu_map[data]
         await event.edit(title, buttons=buttons)
 
-    elif data in [b"manual_activate_start", b"extend_subscription_start"] and user_id in ADMIN_IDS:
+    elif data in [b"manual_activate_start", b"extend_subscription_start"] and is_staff(user_id):
         mode = "extend" if data == b"extend_subscription_start" else "activate"
         user_states[user_id] = {"step": f"awaiting_{mode}_user_id", "mode": mode}
         title = "تمديد" if mode == "extend" else "تفعيل"
         await event.edit(f"➕ **{title} البوت لمستخدم:**\n\nأرسل آيدي المستخدم الرقمي الآن:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data in [b"manual_toggle_tastir", b"manual_toggle_source"] and user_id in ADMIN_IDS:
+    elif data in [b"manual_toggle_tastir", b"manual_toggle_source"] and is_staff(user_id):
         state = user_states.get(user_id, {})
         if state.get("step") != "awaiting_manual_choices":
             await event.answer("⚠️ ابدأ عملية التفعيل أو التمديد أولاً.", alert=True)
@@ -5188,7 +5696,7 @@ async def callback_handler(event):
         state[key] = not state.get(key, False)
         await event.edit("✅ **اختيار نوع الاشتراك:**\n\nحدد الاشتراكات ثم اضغط تأكيد.", buttons=manual_subscription_keyboard(state))
 
-    elif data == b"manual_confirm" and user_id in ADMIN_IDS:
+    elif data == b"manual_confirm" and is_staff(user_id):
         state = user_states.get(user_id, {})
         if state.get("step") != "awaiting_manual_choices":
             await event.answer("⚠️ لا توجد عملية تفعيل معلقة.", alert=True)
@@ -5219,7 +5727,7 @@ async def callback_handler(event):
             pass
         await event.edit(f"✅ تم {'تمديد' if state.get('mode') == 'extend' else 'تفعيل'} اشتراك المستخدم `{target}` لمدة {days} يوم: {' + '.join(types)}.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"activation_log_menu" and user_id in ADMIN_IDS:
+    elif data == b"activation_log_menu" and is_staff(user_id):
         rows = activation_log[-30:][::-1]
         if not rows:
             txt = "📋 **سجل التفعيل:**\n\nلا يوجد سجل حتى الآن."
@@ -5234,7 +5742,7 @@ async def callback_handler(event):
             txt = "📋 **سجل التفعيل:**\n\n" + "\n\n".join(blocks)
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
-    elif data in [b"expired_today_menu", b"expired_codes_menu"] and user_id in ADMIN_IDS:
+    elif data in [b"expired_today_menu", b"expired_codes_menu"] and is_staff(user_id):
         cutoff = time.time() - (30 * 86400)
         rows = sorted([row for row in expired_code_history if row.get('time', 0) >= cutoff], key=lambda row: row.get('time', 0), reverse=True)
         if not rows:
@@ -5338,6 +5846,182 @@ async def callback_handler(event):
             "• اكتب في المحادثة أو القروب: `مسح الكل` وسيبدأ البوت فوراً بمسح جميع رسائلِك بالكامل."
         )
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"source_features_menu")]])
+
+    elif data == b"nick_am_menu":
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"toggle_nick_am":
+        enabled = not users_db[user_id].get("nick_am_enabled", False)
+        users_db[user_id]["nick_am_enabled"] = enabled
+        if not enabled:
+            stop_running_task(user_id, mode="nick_am")
+        save_data()
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"toggle_nick_am_reply":
+        users_db[user_id]["nick_am_reply_enabled"] = not users_db[user_id].get("nick_am_reply_enabled", True)
+        save_data()
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"add_nick_am":
+        user_states[user_id] = {"step": "awaiting_nick_am"}
+        await event.edit("➕ أرسل النص المراد إضافته إلى نيك ام:", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif data == b"show_nick_am":
+        private_phrases = users_db[user_id].get("nick_am", [])
+        tastir_phrases = users_db[user_id].get("tastir", []) + default_tastir
+        fardiyyat_phrases = users_db[user_id].get("fardiyyat", []) + default_fardiyyat
+        include_tastir = users_db[user_id].get("include_tastir_in_nick_am", True)
+        include_fardiyyat = users_db[user_id].get("include_fardiyyat_in_nick_am", True)
+
+        sections = []
+        if private_phrases:
+            sections.append("🏷️ **نصوص نيك ام:**\n" + "\n".join([f"• `{phrase}`" for phrase in private_phrases]))
+        if include_tastir and tastir_phrases:
+            sections.append("📝 **التسطير المضمن بالنيك ام:**\n" + "\n".join([f"• `{phrase}`" for phrase in tastir_phrases]))
+        if include_fardiyyat and fardiyyat_phrases:
+            sections.append("🎯 **الفرديات المضمنة بالنيك ام:**\n" + "\n".join([f"• `{phrase}`" for phrase in fardiyyat_phrases]))
+
+        output = "📋 **نصوص نيك ام النشطة حالياً:**\n\n" + ("\n\n".join(sections) if sections else "لا توجد نصوص نيك ام أو مصادر مضمّنة نشطة.")
+        await event.edit(output, buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif data == b"del_nick_am_sub":
+        buttons = [
+            [Button.inline("🗑️ حذف نص محدد", b"del_nick_am_item_start")],
+            [Button.inline("⚠️ حذف شامل (نصوص نيك ام فقط)", b"clear_nick_am")],
+            [Button.inline("🔙 رجوع", b"nick_am_menu")],
+        ]
+        await event.edit("❌ **خيارات حذف نصوص نيك ام:**", buttons=buttons)
+
+    elif data == b"del_nick_am_item_start":
+        phrases = users_db[user_id].get("nick_am", [])
+        if not phrases:
+            await event.answer("⚠️ لا توجد نصوص مضافة لنيك ام لحذفها.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_del_nick_am_item"}
+        output = "📋 **أرسل النص الذي تريد حذفه من نيك ام:**\n\n" + "\n".join([f"• `{phrase}`" for phrase in phrases])
+        await event.edit(output, buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif data == b"clear_nick_am":
+        users_db[user_id]["nick_am"] = []
+        save_data()
+        await event.answer("⚠️ تم مسح نصوص نيك ام الخاصة فقط.", alert=True)
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"tog_nick_am_tastir":
+        users_db[user_id]["include_tastir_in_nick_am"] = not users_db[user_id].get("include_tastir_in_nick_am", True)
+        save_data()
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"tog_nick_am_fardiyyat":
+        users_db[user_id]["include_fardiyyat_in_nick_am"] = not users_db[user_id].get("include_fardiyyat_in_nick_am", True)
+        save_data()
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"tog_nick_am_stop":
+        users_db[user_id]["del_nick_am_stop"] = not users_db[user_id].get("del_nick_am_stop", True)
+        save_data()
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"add_nick_am_stop":
+        user_states[user_id] = {"step": "awaiting_nick_am_stop"}
+        await event.edit("⏹️ أرسل نص أمر إيقاف نيك ام الجديد:", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif data == b"show_nick_am_stop":
+        commands = users_db[user_id].get("nick_am_stop_cmds", [])
+        text_out = "📜 **أوامر إيقاف نيك ام الحالية:**\n\n" + "\n".join([f"• `{command}`" for command in commands])
+        await event.edit(text_out, buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif data == b"clear_nick_am_stop":
+        users_db[user_id]["nick_am_stop_cmds"] = []
+        save_data()
+        await event.answer("❌ تم حذف جميع أوامر إيقاف نيك ام.", alert=True)
+        await event.edit("🏷️ **قائمة نيك ام:**", buttons=nick_am_menu_keyboard(user_id))
+
+    elif data == b"tastir_ops_menu":
+        await event.edit(
+            "🛑 **إيقاف عمليات قسم التسطير:**\n\n"
+            "هذه القائمة تخص التسطير والفرديات والريبلاي ونيك ام فقط، ولا تؤثر في النشر أو بقية مميزات السورس.",
+            buttons=tastir_operations_menu_keyboard(),
+        )
+
+    elif data == b"tastir_ops_stop_all":
+        stopped_count = stop_tastir_section_tasks(user_id)
+        if not stopped_count:
+            await event.answer("ليس هناك عمليات شغالة في قسم التسطير.", alert=True)
+            return
+        await event.edit(
+            f"✅ تم إيقاف `{stopped_count}` عملية من عمليات قسم التسطير.",
+            buttons=tastir_operations_menu_keyboard(),
+        )
+
+    elif data == b"tastir_ops_list":
+        operations = get_tastir_section_tasks(user_id)
+        if not operations:
+            await event.edit(
+                "ℹ️ ليس هناك عمليات شغالة في قسم التسطير حالياً.",
+                buttons=tastir_operations_menu_keyboard(),
+            )
+            return
+        rows = []
+        for index, (task_key, info) in enumerate(operations, 1):
+            token = register_tastir_operation_view(user_id, task_key)
+            elapsed = format_tastir_elapsed(info.get("started_at"))
+            mode_title = tastir_operation_title(info.get("mode"))
+            rows.append([Button.inline(f"{index}. {mode_title} — شغالة منذ {elapsed}", f"tastir_op_view_{token}")])
+        rows.append([Button.inline("🔙 رجوع", b"tastir_ops_menu")])
+        await event.edit("📋 **العمليات الشغالة:**\n\nاختر عملية لعرض مكانها وتفاصيلها وإيقافها:", buttons=rows)
+
+    elif data.startswith(b"tastir_op_view_"):
+        token = data.decode().replace("tastir_op_view_", "", 1)
+        view = tastir_operation_views.get(token)
+        if not view or view.get("owner_id") != user_id:
+            await event.answer("انتهت صلاحية هذه القائمة. افتح العمليات مرة أخرى.", alert=True)
+            return
+        task_key = tuple(view.get("task_key", ()))
+        info = running_tasks.get(task_key)
+        if not info or info.get("owner_id") != user_id or info.get("mode") not in TASTIR_OPERATION_MODES:
+            await event.answer("هذه العملية توقفت بالفعل.", alert=True)
+            return
+        mode_title = tastir_operation_title(info.get("mode"))
+        started_at = info.get("started_at")
+        started_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started_at)) if started_at else "غير متاح"
+        location_text = await format_tastir_operation_location(user_id, info)
+        extra = ""
+        if info.get("mode") == "nick_am":
+            extra = f"\n• الاسم المستخدم: `{info.get('nick_prefix', 'غير محدد')}`"
+        detail = (
+            f"📌 **تفاصيل عملية {mode_title}:**\n\n"
+            f"• بدأت في: `{started_text}`\n"
+            f"• تعمل منذ: `{format_tastir_elapsed(started_at)}`{extra}\n\n"
+            f"{location_text}"
+        )
+        await event.edit(
+            detail,
+            buttons=[
+                [Button.inline("🛑 إيقاف هذه العملية", f"tastir_op_stop_{token}")],
+                [Button.inline("🔙 رجوع إلى العمليات", b"tastir_ops_list")],
+            ],
+            link_preview=False,
+        )
+
+    elif data.startswith(b"tastir_op_stop_"):
+        token = data.decode().replace("tastir_op_stop_", "", 1)
+        view = tastir_operation_views.get(token)
+        if not view or view.get("owner_id") != user_id:
+            await event.answer("انتهت صلاحية هذه القائمة. افتح العمليات مرة أخرى.", alert=True)
+            return
+        task_key = tuple(view.get("task_key", ()))
+        info = running_tasks.get(task_key)
+        if not info or info.get("owner_id") != user_id or info.get("mode") not in TASTIR_OPERATION_MODES:
+            await event.answer("هذه العملية متوقفة بالفعل.", alert=True)
+            return
+        stop_running_task(user_id, info.get("chat_id"), info.get("target_user_id"), info.get("mode"))
+        tastir_operation_views.pop(token, None)
+        await event.edit(
+            f"✅ تم إيقاف عملية **{tastir_operation_title(info.get('mode'))}** بنجاح.",
+            buttons=tastir_operations_menu_keyboard(),
+        )
 
     elif data == b"tastir_menu":
         await event.edit("📝 **قائمة التسطير:**\nيرجى تحديد الخيار المطلوب:", buttons=tastir_menu_keyboard(user_id))
@@ -5768,23 +6452,23 @@ async def callback_handler(event):
             await event.edit(f"⚡ **ضبط السرعة:**\n⏱️ السرعة الحالية: `{cur_spd}` ثانية", buttons=speed_menu_keyboard())
 
     elif data == b"admin_menu":
-        if user_id not in ADMIN_IDS:
+        if not is_staff(user_id):
             await event.answer("⚠️ هذه القائمة مخصصة للمسؤولين فقط.", alert=True)
             return
-        await event.edit("👑 **لوحة تحكم المسؤول:**", buttons=admin_menu_keyboard())
+        await event.edit("👑 **لوحة تحكم المسؤول:**", buttons=admin_menu_keyboard(user_id))
 
-    elif data == b"admin_tastir_menu" and user_id in ADMIN_IDS:
+    elif data == b"admin_tastir_menu" and is_staff(user_id):
         await event.edit("📝 **إدارة التسطير الأساسي (العام):**", buttons=admin_tastir_menu_keyboard())
 
-    elif data == b"add_def_tastir" and user_id in ADMIN_IDS:
+    elif data == b"add_def_tastir" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_add_def_tastir"}
         await event.edit("➕ أرسل الجملة الأساسية للتسطير (لتنضاف تلقائياً للجميع):", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
 
-    elif data == b"show_def_tastir" and user_id in ADMIN_IDS:
+    elif data == b"show_def_tastir" and is_staff(user_id):
         txt = "📋 **قائمة التسطير الأساسية الحالية:**\n\n" + ("\n".join([f"• `{p}`" for p in default_tastir]) if default_tastir else "لا توجد جمل أساسية مضافة.")
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
 
-    elif data == b"del_def_tastir_item_start" and user_id in ADMIN_IDS:
+    elif data == b"del_def_tastir_item_start" and is_staff(user_id):
         if not default_tastir:
             await event.answer("⚠️ لا توجد جمل أساسية لحذفها.", alert=True)
             return
@@ -5794,24 +6478,24 @@ async def callback_handler(event):
             txt += f"• `{p}`\n"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
 
-    elif data == b"clear_def_tastir" and user_id in ADMIN_IDS:
+    elif data == b"clear_def_tastir" and is_staff(user_id):
         default_tastir = []
         save_data()
         await event.answer("⚠️ تم مسح جميع جمل التسطير الأساسية.", alert=True)
         await event.edit("📝 **إدارة التسطير الأساسي:**", buttons=admin_tastir_menu_keyboard())
 
-    elif data == b"admin_fardiyyat_menu" and user_id in ADMIN_IDS:
+    elif data == b"admin_fardiyyat_menu" and is_staff(user_id):
         await event.edit("🎯 **إدارة الفرديات الأساسية (العامة):**", buttons=admin_fardiyyat_menu_keyboard())
 
-    elif data == b"add_def_fardiyyat" and user_id in ADMIN_IDS:
+    elif data == b"add_def_fardiyyat" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_add_def_fardiyyat"}
         await event.edit("➕ أرسل الكلمة الأساسية للفرديات (لتنضاف تلقائياً للجميع):", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
 
-    elif data == b"show_def_fardiyyat" and user_id in ADMIN_IDS:
+    elif data == b"show_def_fardiyyat" and is_staff(user_id):
         txt = "📋 **قائمة الفرديات الأساسية الحالية:**\n\n" + ("\n".join([f"• `{p}`" for p in default_fardiyyat]) if default_fardiyyat else "لا توجد كلمات أساسية مضافة.")
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
 
-    elif data == b"del_def_fardiyyat_item_start" and user_id in ADMIN_IDS:
+    elif data == b"del_def_fardiyyat_item_start" and is_staff(user_id):
         if not default_fardiyyat:
             await event.answer("⚠️ لا توجد كلمات أساسية لحذفها.", alert=True)
             return
@@ -5821,37 +6505,47 @@ async def callback_handler(event):
             txt += f"• `{p}`\n"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
 
-    elif data == b"clear_def_fardiyyat" and user_id in ADMIN_IDS:
+    elif data == b"clear_def_fardiyyat" and is_staff(user_id):
         default_fardiyyat = []
         save_data()
         await event.answer("⚠️ تم مسح جميع كلمات الفرديات الأساسية.", alert=True)
         await event.edit("🎯 **إدارة الفرديات الأساسية:**", buttons=admin_fardiyyat_menu_keyboard())
 
-    elif data == b"broadcast_start" and user_id in ADMIN_IDS:
+    elif data == b"broadcast_start" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_broadcast_msg"}
         await event.edit("📢 **الإذاعة العامة:**\n\nأرسل الرسالة المراد إرسالها لجميع المستخدِمين الآن:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"gen_code" and user_id in ADMIN_IDS:
+    elif data == b"gen_code" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_code_days"}
         await event.edit("🎟️ **توليد رمز اشتراك جديد:**\n\nأرسل مدة الاشتراك بالأيام (مثال: `30`):", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"gen_source_code" and user_id in ADMIN_IDS:
+    elif data == b"gen_source_code" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_source_code_days"}
         await event.edit("🎟️ **توليد كود مميزات السورس جديد:**\n\nأرسل مدة اشتراك مميزات السورس بالأيام (مثال: `30`):", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
 
-    elif data == b"gen_all_code" and user_id in ADMIN_IDS:
+    elif data == b"gen_all_code" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_all_code_days"}
         await event.edit("✨ **توليد كود جميع الصلاحيات:**\n\nأرسل مدة الاشتراك بالأيام. هذا الكود يفعل التسطير ومميزات السورس معاً:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
 
-    elif data == b"list_admins" and user_id in ADMIN_IDS:
-        await event.edit("جاري تحميل قائمة المسؤولين...")
-        txt = "👥 **قائمة المسؤولين في النظام:**\n\n"
-        for idx, aid in enumerate(ADMIN_IDS, 1):
-            user_info_str = await format_user_details(aid)
-            txt += f"**{idx}.**\n{user_info_str}\n\n"
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]], link_preview=False)
+    elif data == b"list_admins" and is_owner(user_id):
+        await event.edit("جاري تحميل قائمة الإدارة...")
+        sections = ["👑 **قائمة الإدارة:**\n"]
+        sections.append("**الريس:**\n" + await format_user_details(OWNER_ID))
+        if RESPONSIBLE_IDS:
+            responsible_rows = []
+            for index, responsible_id in enumerate(RESPONSIBLE_IDS, 1):
+                responsible_rows.append(f"**{index}.**\n" + await format_user_details(responsible_id))
+            sections.append("⭐ **المسؤولون:**\n" + "\n\n".join(responsible_rows))
+        if ADMIN_IDS:
+            admin_rows = []
+            for index, admin_id in enumerate(ADMIN_IDS, 1):
+                if admin_id == OWNER_ID or admin_id in RESPONSIBLE_IDS:
+                    continue
+                admin_rows.append(f"**{index}.**\n" + await format_user_details(admin_id))
+            sections.append("👤 **الأدمنية:**\n" + ("\n\n".join(admin_rows) if admin_rows else "لا يوجد أدمنية مضافون."))
+        await event.edit("\n\n".join(sections), buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]], link_preview=False)
 
-    elif data == b"list_users" and user_id in ADMIN_IDS:
+    elif data == b"list_users" and is_staff(user_id):
         await event.edit("جاري تنظيف وتحميل قائمة المستخدمين...")
         now = time.time()
         for stale_uid, stale_info in list(users_db.items()):
@@ -5887,19 +6581,99 @@ async def callback_handler(event):
 
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]], link_preview=False)
 
-    elif data == b"revoke_user_start" and user_id in ADMIN_IDS:
+    elif data == b"revoke_user_start" and is_staff(user_id):
         user_states[user_id] = {"step": "awaiting_revoke_user_id"}
         await event.edit("🗑️ **حذف مستخدم نهائياً:**\n\nأرسل المعرف الرقمي (ID) للمستخدم المراد إلغاء اشتراكه وتصفيره:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"add_admin_start" and user_id in ADMIN_IDS:
+    elif data == b"add_admin_start" and is_owner(user_id):
         user_states[user_id] = {"step": "awaiting_new_admin_id"}
         await event.edit("➕ **إضافة مسؤول جديد:**\n\nأرسل المعرف الرقمي (ID) لشخص المراد ترقيته:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"delete_admin_start" and user_id in ADMIN_IDS:
+    elif data == b"delete_admin_start" and is_owner(user_id):
         user_states[user_id] = {"step": "awaiting_delete_admin_id"}
         await event.edit("❌ **حذف مسؤول:**\n\nأرسل المعرف الرقمي (ID) للمسؤول المراد إزالته:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"backup_export" and user_id in ADMIN_IDS:
+    elif data == b"change_channel_start":
+        user_states[user_id] = {"step": "awaiting_channel_url"}
+        await event.edit("📢 أرسل رابط قناة البوت الجديد أو يوزرها:", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
+
+    elif data == b"manage_developers_menu":
+        buttons = []
+        rows = []
+        for index, item in enumerate(DEVELOPERS[:3], 1):
+            title = "👑 الريس" if index == 1 else f"👨‍💻 المطور {index}"
+            rows.append(f"• {title}: @{item.get('username', 'غير محدد')}")
+            buttons.append([Button.inline(f"✏️ تغيير {title}", f"edit_developer_{index - 1}".encode())])
+            if index > 1:
+                buttons.append([Button.inline(f"🗑️ حذف {title}", f"delete_developer_{index - 1}".encode())])
+        listing = "\n".join(rows) if rows else "لا يوجد مطورون مضافون."
+        if len(DEVELOPERS) < 3:
+            buttons.append([Button.inline("➕ إضافة مطور", b"add_developer_start")])
+        buttons.append([Button.inline("🔙 رجوع", b"admin_data_menu")])
+        await event.edit("👨‍💻 **المطورون في القائمة الرئيسية:**\n\n" + listing, buttons=buttons)
+
+    elif data.startswith(b"edit_developer_"):
+        if not is_owner(user_id):
+            await event.answer("⚠️ تعذر الوصول: هذه الإدارة مخصصة للريس فقط.", alert=True)
+            return
+        try:
+            developer_index = int(data.decode().rsplit("_", 1)[-1])
+        except ValueError:
+            await event.answer("⚠️ اختيار المطور غير صحيح.", alert=True)
+            return
+        if developer_index < 0 or developer_index >= len(DEVELOPERS):
+            await event.answer("⚠️ المطور غير موجود.", alert=True)
+            return
+        title = "الريس" if developer_index == 0 else f"المطور {developer_index + 1}"
+        user_states[user_id] = {"step": "awaiting_developer_username", "developer_index": developer_index}
+        await event.edit(f"👨‍💻 أرسل يوزر {title} الجديد:", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+
+    elif data.startswith(b"delete_developer_"):
+        if not is_owner(user_id):
+            await event.answer("⚠️ تعذر الوصول: هذه الإدارة مخصصة للريس فقط.", alert=True)
+            return
+        try:
+            developer_index = int(data.decode().rsplit("_", 1)[-1])
+        except ValueError:
+            await event.answer("⚠️ اختيار المطور غير صحيح.", alert=True)
+            return
+        if developer_index <= 0 or developer_index >= len(DEVELOPERS):
+            await event.answer("⚠️ لا يمكن حذف الريس أو المطور غير الموجود.", alert=True)
+            return
+        removed = DEVELOPERS.pop(developer_index)
+        save_data(force=True)
+        await event.answer(f"✅ تم حذف @{removed.get('username', 'المطور')} من القائمة الرئيسية.", alert=True)
+        await event.edit("👨‍💻 **المطورون في القائمة الرئيسية:**", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+
+    elif data == b"add_developer_start":
+        if len(DEVELOPERS) >= 3:
+            await event.answer("⚠️ وصلت إلى الحد الأقصى: ثلاثة مطورين.", alert=True)
+            return
+        user_states[user_id] = {"step": "awaiting_developer_username", "developer_index": None}
+        await event.edit("👨‍💻 أرسل يوزر المطور الجديد:", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+
+    elif data == b"list_responsibles":
+        rows = []
+        for index, responsible_id in enumerate(RESPONSIBLE_IDS, 1):
+            rows.append(f"**{index}.**\n" + await format_user_details(responsible_id))
+        text_out = "⭐ **قائمة المسؤولين:**\n\n" + ("\n\n".join(rows) if rows else "لا يوجد مسؤولون مرفوعون حالياً.")
+        await event.edit(text_out, buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]], link_preview=False)
+
+    elif data == b"delete_responsible_start":
+        if not RESPONSIBLE_IDS:
+            await event.answer("⚠️ لا يوجد مسؤولون لحذفهم.", alert=True)
+            return
+        rows = []
+        for index, responsible_id in enumerate(RESPONSIBLE_IDS, 1):
+            rows.append(f"• {index}. `{responsible_id}`")
+        user_states[user_id] = {"step": "awaiting_delete_responsible_id"}
+        await event.edit("❌ أرسل آيدي المسؤول الذي تريد حذفه:\n\n" + "\n".join(rows), buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+
+    elif data == b"add_responsible_start":
+        user_states[user_id] = {"step": "awaiting_responsible_id"}
+        await event.edit("⭐ أرسل آيدي الشخص الذي تريد رفعه مسؤولاً:", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+
+    elif data == b"backup_export" and (is_owner(user_id) or is_responsible(user_id)):
         try:
             backup_path = create_settings_backup()
             await bot.send_file(user_id, backup_path, caption="💾 نسخة احتياطية للإعدادات والاشتراكات والأكواد. لا تتضمن ملفات الجلسات الحساسة.")
@@ -5907,11 +6681,11 @@ async def callback_handler(event):
             await report_admin_error("إنشاء نسخة احتياطية", e, user_id)
             await event.answer("❌ تعذر إنشاء النسخة الاحتياطية.", alert=True)
 
-    elif data == b"backup_import_start" and user_id in ADMIN_IDS:
+    elif data == b"backup_import_start" and is_owner(user_id):
         user_states[user_id] = {"step": "awaiting_backup_import"}
         await event.edit("📥 أرسل الآن ملف النسخة الاحتياطية بصيغة JSON. سيتم حفظ نسخة تلقائية من البيانات الحالية قبل الاستيراد.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
-    elif data == b"sessions_menu" and user_id in ADMIN_IDS:
+    elif data == b"sessions_menu" and (is_owner(user_id) or is_responsible(user_id)):
         saved_ids = list_saved_session_ids()
         connected_ids = sorted(user_clients.keys())
         async def _session_rows(ids):
@@ -5930,11 +6704,11 @@ async def callback_handler(event):
             link_preview=False
         )
 
-    elif data == b"session_disconnect_start" and user_id in ADMIN_IDS:
+    elif data == b"session_disconnect_start" and is_owner(user_id):
         user_states[user_id] = {"step": "awaiting_disconnect_session_id"}
         await event.edit("❌ أرسل آيدي المستخدم الذي تريد فصل جلسته. لن يتم حذف اشتراكه أو بياناته، لكنه يحتاج لتسجيل الدخول من جديد.", buttons=[[Button.inline("🔙 رجوع", b"sessions_menu")]])
 
-    elif data == b"admin_error_log_menu" and user_id in ADMIN_IDS:
+    elif data == b"admin_error_log_menu" and (is_owner(user_id) or is_responsible(user_id)):
         if not admin_error_log:
             await event.edit("✅ لا توجد أخطاء دخول أو تفعيل مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
         else:
@@ -5944,13 +6718,13 @@ async def callback_handler(event):
                 rows.append(f"**{idx}.** `{when}`\n• العملية: {item.get('operation')}\n• الاسم: {item.get('name', 'غير محدد')}\n• الآيدي: `{item.get('user_id') or '-'}`\n• اليوزر: {item.get('username', 'ماعنده')}\n• السبب: `{item.get('error')}`")
             await event.edit("⚠️ **سجل أخطاء الدخول والتفعيل:**\n\n" + "\n\n".join(rows), buttons=[[Button.inline("🗑️ مسح سجل الأخطاء", b"admin_error_log_clear")], [Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
-    elif data == b"admin_error_log_clear" and user_id in ADMIN_IDS:
+    elif data == b"admin_error_log_clear" and is_owner(user_id):
         admin_error_log.clear()
         save_data()
         await event.answer("✅ تم مسح سجل الأخطاء.", alert=True)
         await event.edit("✅ لا توجد أخطاء دخول أو تفعيل مسجلة حالياً.", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
 
-    elif data == b"admin_stats" and user_id in ADMIN_IDS:
+    elif data == b"admin_stats" and is_staff(user_id):
         txt = f"📊 **إحصائيات النظام:**\n\n• إجمالي المسجلين: {len(users_db)}\n• عدد المسؤولين: {len(ADMIN_IDS)}\n• الحسابات المتصلة حالياً: {len(user_clients)}\n• المهام الشغالة حالياً: {len(running_tasks)}"
         await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
 
@@ -5993,7 +6767,7 @@ async def inline_source_menu_handler(event):
 # ==================== Text & Media Input Handlers ====================
 @bot.on(events.NewMessage)
 async def message_input_handler(event):
-    global default_tastir, default_fardiyyat, default_reply, activation_codes, source_activation_codes, all_activation_codes
+    global default_tastir, default_fardiyyat, default_reply, activation_codes, source_activation_codes, all_activation_codes, CHANNEL_URL, DEV_URL
     if not event.is_private or (event.text and event.text.startswith("/")):
         return
 
@@ -6027,8 +6801,86 @@ async def message_input_handler(event):
 
     step = state.get("step")
 
+    if step == "awaiting_channel_url":
+        if not is_owner(user_id):
+            user_states.pop(user_id, None)
+            return
+        channel_username = normalize_telegram_username(text)
+        if not channel_username:
+            await event.respond("⚠️ أرسل رابط قناة صحيحاً أو يوزر قناة صحيحاً.", buttons=[[Button.inline("🔙 رجوع", b"admin_data_menu")]])
+            return
+        CHANNEL_URL = f"https://t.me/{channel_username}"
+        save_data(force=True)
+        user_states.pop(user_id, None)
+        await event.respond("✅ تم تغيير قناة البوت وتحديث زر القائمة الرئيسية.", buttons=main_menu_keyboard(user_id))
+        return
+
+    elif step == "awaiting_developer_username":
+        if not is_owner(user_id):
+            user_states.pop(user_id, None)
+            return
+        developer_username = normalize_telegram_username(text)
+        if not developer_username:
+            await event.respond("⚠️ أرسل يوزر مطور صحيحاً.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+            return
+        developer_index = state.get("developer_index")
+        if any(index != developer_index and item.get("username", "").lower() == developer_username.lower() for index, item in enumerate(DEVELOPERS)):
+            await event.respond("⚠️ هذا المطور موجود بالفعل.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+            return
+        if developer_index is None:
+            if len(DEVELOPERS) >= 3:
+                await event.respond("⚠️ وصلت إلى الحد الأقصى: ثلاثة مطورين.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+                return
+            DEVELOPERS.append({"username": developer_username})
+            success_text = "✅ تم إضافة المطور إلى القائمة الرئيسية."
+        else:
+            try:
+                developer_index = int(developer_index)
+            except (TypeError, ValueError):
+                developer_index = -1
+            if developer_index < 0 or developer_index >= len(DEVELOPERS):
+                await event.respond("⚠️ المطور المحدد لم يعد موجوداً.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
+                return
+            DEVELOPERS[developer_index] = {"username": developer_username}
+            if developer_index == 0:
+                DEV_URL = f"https://t.me/{developer_username}"
+            success_text = "✅ تم تغيير المطور في القائمة الرئيسية."
+        save_data(force=True)
+        user_states.pop(user_id, None)
+        await event.respond(success_text, buttons=main_menu_keyboard(user_id))
+        return
+
+    elif step == "awaiting_responsible_id":
+        if not is_owner(user_id) or not text.isdigit():
+            await event.respond("⚠️ أرسل آيدي رقمي صحيح.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+            return
+        responsible_id = int(text)
+        if responsible_id == OWNER_ID:
+            await event.respond("⚠️ هذا هو الريس بالفعل.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+            return
+        if responsible_id not in RESPONSIBLE_IDS:
+            RESPONSIBLE_IDS.append(responsible_id)
+            save_data(force=True)
+        user_states.pop(user_id, None)
+        await event.respond("✅ تم رفع الشخص مسؤولاً كاملاً.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+        return
+
+    elif step == "awaiting_delete_responsible_id":
+        if not is_owner(user_id) or not text.isdigit():
+            await event.respond("⚠️ أرسل آيدي المسؤول الرقمي.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+            return
+        responsible_id = int(text)
+        if responsible_id not in RESPONSIBLE_IDS:
+            await event.respond("⚠️ هذا الآيدي ليس ضمن قائمة المسؤولين.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+            return
+        RESPONSIBLE_IDS.remove(responsible_id)
+        save_data(force=True)
+        user_states.pop(user_id, None)
+        await event.respond("✅ تم حذف المسؤول بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"admin_admins_menu")]])
+        return
+
     if step == "awaiting_backup_import":
-        if user_id not in ADMIN_IDS:
+        if not is_owner(user_id):
             user_states.pop(user_id, None)
             return
         if not event.document:
@@ -6061,7 +6913,7 @@ async def message_input_handler(event):
         return
 
     elif step == "awaiting_disconnect_session_id":
-        if user_id not in ADMIN_IDS or not text.isdigit():
+        if not is_owner(user_id) or not text.isdigit():
             await event.respond("⚠️ أرسل آيدي رقمي صحيح.", buttons=[[Button.inline("🔙 رجوع", b"sessions_menu")]])
             return
         target_id = int(text)
@@ -6179,7 +7031,7 @@ async def message_input_handler(event):
             await event.respond(f"❌ لم يتم العثور على القروب/القناة أو حدث خطأ:\n`{e}`\n\nتأكد من الرابط أو المعرف وأرسله مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"flush_menu")]])
         return
 
-    elif step in ["awaiting_activate_user_id", "awaiting_extend_user_id"] and user_id in ADMIN_IDS:
+    elif step in ["awaiting_activate_user_id", "awaiting_extend_user_id"] and is_staff(user_id):
         if not text.isdigit():
             await event.respond("⚠️ أرسل آيدي رقمي صحيح للمستخدم:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             return
@@ -6189,7 +7041,7 @@ async def message_input_handler(event):
         await event.respond("📅 أرسل عدد أيام الاشتراك:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
         return
 
-    elif step in ["awaiting_activate_days", "awaiting_extend_days"] and user_id in ADMIN_IDS:
+    elif step in ["awaiting_activate_days", "awaiting_extend_days"] and is_staff(user_id):
         if not text.isdigit() or int(text) <= 0:
             await event.respond("⚠️ أرسل عدد أيام صحيح أكبر من صفر:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             return
@@ -6201,7 +7053,7 @@ async def message_input_handler(event):
         await event.respond(f"✅ **اختيار اشتراكات {title}:**\n\nالمستخدم: `{state['target_uid']}`\nالمدة: `{state['days']}` يوم\n\nاختر الاشتراكات ثم أكد:", buttons=manual_subscription_keyboard(state))
         return
 
-    elif step == "awaiting_code_days" and user_id in ADMIN_IDS:
+    elif step == "awaiting_code_days" and is_staff(user_id):
         if not text.isdigit():
             await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
             return
@@ -6214,7 +7066,7 @@ async def message_input_handler(event):
         await event.respond(f"✅ **تم توليد كود التسطير بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
         return
 
-    elif step == "awaiting_source_code_days" and user_id in ADMIN_IDS:
+    elif step == "awaiting_source_code_days" and is_staff(user_id):
         if not text.isdigit() or int(text) <= 0:
             await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
             return
@@ -6227,7 +7079,7 @@ async def message_input_handler(event):
         await event.respond(f"✅ **تم توليد كود مميزات السورس بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
         return
 
-    elif step == "awaiting_all_code_days" and user_id in ADMIN_IDS:
+    elif step == "awaiting_all_code_days" and is_staff(user_id):
         if not text.isdigit() or int(text) <= 0:
             await event.respond("⚠️ يرجى إرسال رقم صحيح يمثل عدد الأيام:", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
             return
@@ -6240,13 +7092,13 @@ async def message_input_handler(event):
         await event.respond(f"✅ **تم توليد كود جميع الصلاحيات بنجاح:**\n\n• الكود: `{code}`\n• المدة: `{days}` يوم\n• التفعيل: التسطير + مميزات السورس", buttons=[[Button.inline("🔙 رجوع", b"admin_codes_menu")]])
         return
 
-    elif step == "awaiting_add_def_tastir" and user_id in ADMIN_IDS:
+    elif step == "awaiting_add_def_tastir" and is_staff(user_id):
         default_tastir.append(text)
         save_data()
         await event.respond("✅ تم إضافة الجملة الأساسية للتسطير بنجاح وتحديثها للجميع.\n\nيمكنك إرسال جملة أخرى أو الضغط على رجوع:", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
         return
 
-    elif step == "awaiting_del_def_tastir_item" and user_id in ADMIN_IDS:
+    elif step == "awaiting_del_def_tastir_item" and is_staff(user_id):
         if text in default_tastir:
             default_tastir.remove(text)
             save_data()
@@ -6255,13 +7107,13 @@ async def message_input_handler(event):
             await event.respond("❌ الجملة غير موجودة في التسطير الأساسي، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"admin_tastir_menu")]])
         return
 
-    elif step == "awaiting_add_def_fardiyyat" and user_id in ADMIN_IDS:
+    elif step == "awaiting_add_def_fardiyyat" and is_staff(user_id):
         default_fardiyyat.append(text)
         save_data()
         await event.respond("✅ تم إضافة الكلمة الأساسية للفرديات بنجاح وتحديثها للجميع.\n\nيمكنك إرسال كلمة أخرى أو الضغط على رجوع:", buttons=[[Button.inline("🔙 رجوع", b"admin_fardiyyat_menu")]])
         return
 
-    elif step == "awaiting_del_def_fardiyyat_item" and user_id in ADMIN_IDS:
+    elif step == "awaiting_del_def_fardiyyat_item" and is_staff(user_id):
         if text in default_fardiyyat:
             default_fardiyyat.remove(text)
             save_data()
@@ -6295,7 +7147,7 @@ async def message_input_handler(event):
             await report_admin_error("كود جميع الصلاحيات غير صالح", "محاولة كود جميع الصلاحيات غير صالح أو مستخدم", user_id)
             await event.respond("❌ كود جميع الصلاحيات غير صالح أو تم استخدامه سابقاً.")
 
-    elif step == "awaiting_broadcast_msg" and user_id in ADMIN_IDS:
+    elif step == "awaiting_broadcast_msg" and is_staff(user_id):
         user_states.pop(user_id, None)
         msg = await event.respond("⏳ جاري إرسال الإذاعة لجميع المستخدمين...")
         success_count = 0
@@ -6314,7 +7166,7 @@ async def message_input_handler(event):
         )
         return
 
-    elif step == "awaiting_revoke_user_id" and user_id in ADMIN_IDS:
+    elif step == "awaiting_revoke_user_id" and is_staff(user_id):
         user_states.pop(user_id, None)
         if not text.isdigit():
             await event.respond("⚠️ يرجى إرسال معرف رقمي (ID) صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
@@ -6327,7 +7179,7 @@ async def message_input_handler(event):
             await event.respond("❌ المستخدم غير مسجل في قاعدة البيانات.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
         return
 
-    elif step == "awaiting_new_admin_id" and user_id in ADMIN_IDS:
+    elif step == "awaiting_new_admin_id" and is_owner(user_id):
         user_states.pop(user_id, None)
         if not text.isdigit():
             await event.respond("⚠️ يرجى إرسال معرف رقمي (ID) صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
@@ -6344,7 +7196,7 @@ async def message_input_handler(event):
             await event.respond("⚠️ المستخدم مسجل كمسؤول مسبقاً.", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
         return
 
-    elif step == "awaiting_delete_admin_id" and user_id in ADMIN_IDS:
+    elif step == "awaiting_delete_admin_id" and is_owner(user_id):
         user_states.pop(user_id, None)
         if not text.isdigit():
             await event.respond("⚠️ يرجى إرسال معرف رقمي (ID) صحيح:", buttons=[[Button.inline("🔙 رجوع", b"admin_menu")]])
@@ -6464,6 +7316,16 @@ async def message_input_handler(event):
         save_data()
         await event.respond("✅ تم إضافة أمر إيقاف التسطير بنجاح.\n\nيمكنك إرسال أمر آخر أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"tastir_menu")]])
 
+    elif step == "awaiting_nick_am_stop":
+        users_db[user_id]["nick_am_stop_cmds"].append(text)
+        save_data()
+        await event.respond("✅ تم إضافة أمر إيقاف نيك ام بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
+    elif step == "awaiting_nick_am":
+        users_db[user_id]["nick_am"].append(text)
+        save_data()
+        await event.respond("✅ تم إضافة النص إلى نيك ام بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+
     elif step == "awaiting_fardiyyat":
         users_db[user_id]["fardiyyat"].append(text)
         save_data()
@@ -6525,6 +7387,14 @@ async def message_input_handler(event):
             await event.respond(f"✅ تم حذف الكلمة: `{text}` بنجاح.\n\nأرسل كلمة أخرى لحذفها، أو اضغط رجوع:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
         else:
             await event.respond("❌ الكلمة غير موجودة، تأكد منها ثم أرسلها مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"fardiyyat_menu")]])
+
+    elif step == "awaiting_del_nick_am_item":
+        if text in users_db[user_id].get("nick_am", []):
+            users_db[user_id]["nick_am"].remove(text)
+            save_data()
+            await event.respond(f"✅ تم حذف النص: `{text}` بنجاح.", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
+        else:
+            await event.respond("❌ النص غير موجود، تأكد منه ثم أرسله مجدداً:", buttons=[[Button.inline("🔙 رجوع", b"nick_am_menu")]])
 
     elif step == "awaiting_del_reply_item":
         if text in users_db[user_id]["reply"]:
