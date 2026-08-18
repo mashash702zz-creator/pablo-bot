@@ -3078,6 +3078,14 @@ async def register_userbot_events(client_inst, owner_id):
                     asyncio.create_task(delete_message_after(sent_message, wait_seconds))
                 return sent_message
 
+            async def send_empty_tastir_notice_private(message):
+                # هذا التنبيه لا يظهر في الشات الذي كُتب فيه الأمر حتى لا يزعج الطرف الآخر.
+                # يرسل فقط إلى خاص بوت الإدارة لصاحب الحساب الذي شغّل الأمر.
+                try:
+                    await bot.send_message(owner_id, message)
+                except Exception:
+                    pass
+
             async def command_reply_file(file, **kwargs):
                 if command_reply_to and "reply_to" not in kwargs:
                     kwargs["reply_to"] = command_reply_to
@@ -3186,7 +3194,7 @@ async def register_userbot_events(client_inst, owner_id):
                     nick_target_user_id, nick_prefix=nick_prefix, nick_target_style=nick_target_style,
                 )
                 if not started:
-                    await command_reply("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
                 return
 
             if legacy_text in t_start:
@@ -3197,7 +3205,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "tastir", legacy_target_msg_id, legacy_target_user_id)
                 if not started:
-                    await command_reply( "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
                 return
 
             if legacy_text in f_start:
@@ -3208,7 +3216,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "fardiyyat", legacy_target_msg_id, legacy_target_user_id)
                 if not started:
-                    await command_reply( "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
                 return
 
             if legacy_text in r_start:
@@ -3221,7 +3229,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await command_reply( "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
                     return
                 if not (user_info.get("reply", []) or default_reply or user_info.get("tastir", []) or default_tastir or user_info.get("fardiyyat", []) or default_fardiyyat):
-                    await command_reply( "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
                     return
                 operation_id = secrets.token_urlsafe(6).replace("-", "x").replace("_", "y")
                 task_key = (owner_id, chat_id, legacy_target_user_id, "reply", operation_id)
@@ -4160,7 +4168,7 @@ async def register_userbot_events(client_inst, owner_id):
                     nick_target_user_id, nick_prefix=nick_prefix, nick_target_style=nick_target_style,
                 )
                 if not started:
-                    await command_reply("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد نصوص نشطة لنيك ام. أضف نصاً أو فعّل تضمين التسطير أو الفرديات.")
                 return
 
             if text in t_start:
@@ -4171,7 +4179,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "tastir", target_msg_id, target_user_id)
                 if not started:
-                    await command_reply( "⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد جمل تسطير محفوظة. أضف جملة أولاً من زر «إضافة جمل التسطير».")
                 return
 
             elif text in f_start:
@@ -4182,7 +4190,7 @@ async def register_userbot_events(client_inst, owner_id):
                         pass
                 started = start_running_task(client_inst, owner_id, chat_id, "fardiyyat", target_msg_id, target_user_id)
                 if not started:
-                    await command_reply( "⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد كلمات فرديات محفوظة. أضف كلمة أولاً من زر «إضافة كلمات الفرديات».")
                 return
 
             elif text in r_start:
@@ -4195,7 +4203,7 @@ async def register_userbot_events(client_inst, owner_id):
                     await command_reply( "⚠️ الريبلاي يحتاج الرد على رسالة شخص داخل القروب أو الخاص، ولا يعمل في محادثة بوت الإدارة.")
                     return
                 if not (user_info.get("reply", []) or default_reply or user_info.get("tastir", []) or default_tastir or user_info.get("fardiyyat", []) or default_fardiyyat):
-                    await command_reply( "⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
+                    await send_empty_tastir_notice_private("⚠️ لا توجد جمل ريبلاي أو تسطير أو فرديات محفوظة لإرسالها.")
                     return
                 task_key = (owner_id, chat_id, target_user_id, "reply")
                 running_tasks[task_key] = {
