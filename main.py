@@ -2411,9 +2411,27 @@ async def send_tastir_commands_menu(client, owner_id, chat_id):
 
 
 # ==================== Source Features: Self Save, Links & Statistics ====================
-async def save_media_to_self_destination(client, owner_id, message):
+def get_self_save_destination(owner_id):
+    """الأولوية: مجموعة ذاتية مخصصة، ثم آخر مجموعة تخزين، ثم الرسائل المحفوظة."""
     init_user_db(owner_id)
-    target_chat_id = users_db[owner_id].get("self_save_chat_id") or "me"
+    info = users_db[owner_id]
+    if info.get("self_save_chat_id"):
+        return info["self_save_chat_id"]
+    storage_groups = info.get("storage_groups", [])
+    return storage_groups[-1] if storage_groups else "me"
+
+
+def self_save_destination_text(owner_id):
+    target = get_self_save_destination(owner_id)
+    if target == "me":
+        return "الرسائل المحفوظة"
+    if users_db.get(owner_id, {}).get("self_save_chat_id") == target:
+        return f"مجموعة الذاتية (`{target}`)"
+    return f"مجموعة التخزين (`{target}`)"
+
+
+async def save_media_to_self_destination(client, owner_id, message):
+    target_chat_id = get_self_save_destination(owner_id)
     try:
         await client.forward_messages(target_chat_id, message)
         return target_chat_id
@@ -2543,20 +2561,28 @@ async def build_account_inspection_report(client, target):
 
 
 async def get_account_chat_lists(client, mode="all"):
+    """يعرض القنوات والسوبرقروبات والقروبات العادية، ولا يعتمد على megagroup فقط."""
     groups = []
     channels = []
     async for dialog in client.iter_dialogs(limit=None):
         entity = dialog.entity
-        if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)):
+        is_broadcast_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
+        is_group = bool(
+            getattr(dialog, "is_group", False)
+            or getattr(entity, "megagroup", False)
+            or (not is_broadcast_channel and hasattr(entity, "participants_count"))
+        )
+        if not is_broadcast_channel and not is_group:
             continue
 
         is_owner = bool(getattr(entity, "creator", False))
-        is_admin = is_owner
+        is_admin = is_owner or bool(getattr(getattr(entity, "admin_rights", None), "post_messages", False))
         try:
             permissions = await client.get_permissions(entity, "me")
             is_owner = is_owner or bool(getattr(permissions, "is_creator", False))
             is_admin = is_admin or bool(getattr(permissions, "is_admin", False))
         except Exception:
+            # قائمة الكل يجب أن تظهر حتى لو كانت صلاحيات بعض الحوارات غير متاحة مؤقتاً.
             pass
 
         if mode == "owner" and not is_owner:
@@ -2564,25 +2590,34 @@ async def get_account_chat_lists(client, mode="all"):
         if mode == "admin" and not is_admin:
             continue
 
-        item = (getattr(entity, "title", "بدون اسم"), entity.id)
-        if getattr(entity, "broadcast", False):
+        item = (getattr(entity, "title", None) or getattr(dialog, "name", None) or "بدون اسم", entity.id)
+        if is_broadcast_channel:
             channels.append(item)
         else:
             groups.append(item)
+    groups.sort(key=lambda item: str(item[0]).casefold())
+    channels.sort(key=lambda item: str(item[0]).casefold())
     return groups, channels
+
+
+def format_account_chat_list(items, title, mode_label):
+    if not items:
+        return f"📂 **{title} {mode_label}:**\n\nلا توجد نتائج."
+    visible = items[:45]
+    rows = [f"**{index}.** {name} — `{chat_id}`" for index, (name, chat_id) in enumerate(visible, 1)]
+    more = f"\n\n⚠️ تم عرض {len(visible)} من أصل {len(items)}." if len(items) > len(visible) else ""
+    return f"📂 **{title} {mode_label}:**\n\n" + "\n".join(rows) + more
 
 
 async def build_stats_report(client):
     me = await client.get_me()
-    groups, channels = await get_account_chat_lists(client, "all")
     return (
         "📊 **إحصائياتي:**\n\n"
         f"• الاسم: {(me.first_name or '')} {(me.last_name or '')}\n"
         f"• الآيدي: `{me.id}`\n"
         f"• اليوزر: @{me.username if me.username else 'ماعنده'}\n"
-        f"• عدد القروبات: `{len(groups)}`\n"
-        f"• عدد القنوات: `{len(channels)}`\n"
-        f"• عمليات النشر الشغالة: `{len(auto_publish_tasks)}`"
+        f"• عمليات النشر الشغالة: `{len(auto_publish_tasks)}`\n"
+        f"• عمليات التسطير والريبلاي الشغالة: `{len(running_tasks)}`"
     )
 
 
@@ -2665,23 +2700,24 @@ AUTO_PUBLISH_GUIDE = """⤾ اوامــر النـشــر التـلـقـائ
 SELF_SAVE_GUIDE = """⤾ اوامــر حـفـظ الذاتـيه 🧧
 ‏⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆
 
-• .تفعيل الذاتيه
-↞ لـ تفعيـل حفـظ الذاتيـه التلقـائي 🏷
+• حفظ الذاتية التلقائي يعمل دائماً للوسائط المؤقتة التي تصلك في الخاص.
+↞ بدون تعيين مجموعة: تُحفظ في الرسائل المحفوظة.
+↞ عند تعيين مجموعة ذاتية أو وجود مجموعة تخزين: تُحفظ في المجموعة بدلاً من المحفوظات.
 
-• .تعطيل الذاتيه
-↞ لـ تعطيـل حفـظ الذاتيـه التلقـائي 🏷
+• .انشاء مجموعة الذاتيه
+↞ ينشئ قروباً خاصاً ويعيّنه لحفظ الذاتية.
 
-• .تعيين مجموعة الذاتيه
-↞ بـ وضـع ايـدي المجموعـة بعد الامـر
+• .تعيين مجموعة الذاتيه + آيدي أو رابط المجموعة
+↞ لتعيين مجموعة موجودة كوجهة لحفظ الذاتية.
 
 • .حذف مجموعة الذاتيه
-↞ لـ حـذف مجموعـة الذاتيـة
+↞ يلغي المجموعة المعيّنة؛ ثم يستخدم مجموعة التخزين إن وجدت، وإلا الرسائل المحفوظة.
 
 • .ذاتيه
-↞ بالـرد علـى الوسـائـط لحفظـها فـي حـال كانـت غيـر مفعلـه تلقـائيـاً 🧧
+↞ بالرد على أي وسيط لحفظه فوراً في وجهة الذاتية الحالية.
 
-↜ ملاحظـه ❤️
-• عند تعيين مجموعـة الذاتيـة فانه سـوف يتـم حفـظ الذاتيـة فيها بدلا مـن الرسائل المحفوظه"""
+• .مقيد أو .حفظ
+↞ ضع رابط الرسالة لحفظ المحتوى المقيد في وجهة الذاتية الحالية."""
 
 WELCOME_GUIDE = """⤾ اوامــر الترحيـب والـردود 🗳
 ‏⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆
@@ -2795,9 +2831,9 @@ GITHUB_GUIDE = """⤾ اوامــر تحمـيل من قيثهوب 📥
 RESTRICTED_GUIDE = """⤾ اوامــر المحتـوى المقيد 🔑
 ‏⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆
 
-• .مقيد او .حفظ
-↞ بـ وضـع رابـط الرسالـه مع الامـر
-↞ لـ حفظ المحتوى المقيد للقنوات والمجموعات الخاصه🛡"""
+• .مقيد أو .حفظ
+↞ ضع رابط الرسالة بعد الأمر.
+↞ يحفظ المحتوى في مجموعة الذاتية المعيّنة، أو مجموعة التخزين، أو الرسائل المحفوظة حسب إعدادك."""
 
 WRITING_GUIDE = """⤾ اوامـر الخطـوط الـكتابـة ✍
 ‏⋆ ——— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › ——— ⋆
@@ -3142,6 +3178,44 @@ async def get_cached_user_me(client_inst, owner_id):
     return me
 
 
+async def cancel_all_user_operations(client, owner_id):
+    """يلغي أي حالة إدخال أو عملية مرتبطة بصاحب الحساب، ويعيد ملخصاً قصيراً."""
+    pending_cancelled = user_states.pop(owner_id, None) is not None
+
+    running_before = sum(1 for info in running_tasks.values() if info.get("owner_id") == owner_id)
+    stop_running_task(owner_id)
+
+    publish_stopped = 0
+    if client:
+        try:
+            publish_stopped = await stop_auto_publish_task(client, owner_id, reason="تم الإلغاء بالأمر .الغاء")
+        except Exception:
+            pass
+
+    try:
+        flush_stopped = await stop_manual_flush_tasks(owner_id)
+    except Exception:
+        flush_stopped = 0
+
+    broadcast_stopped = 0
+    task = broadcast_tasks.pop(owner_id, None)
+    if task and not task.done():
+        task.cancel()
+        broadcast_stopped = 1
+
+    bot_flush_stopped = 0
+    for key, task in list(bot_flush_tasks.items()):
+        if key[0] != owner_id:
+            continue
+        if task and not task.done():
+            task.cancel()
+            bot_flush_stopped += 1
+        bot_flush_tasks.pop(key, None)
+
+    total = running_before + publish_stopped + flush_stopped + broadcast_stopped + bot_flush_stopped
+    return pending_cancelled, total
+
+
 async def register_userbot_events(client_inst, owner_id):
     @client_inst.on(events.NewMessage)
     async def userbot_handler(event):
@@ -3164,6 +3238,7 @@ async def register_userbot_events(client_inst, owner_id):
             async def command_reply(message, **kwargs):
                 # تستخدم النتائج المهمة هذا الخيار لتبقى في المحادثة بدلاً من الحذف المؤقت.
                 keep_result = bool(kwargs.pop("keep_result", False))
+                temporary_seconds = kwargs.pop("temporary_seconds", None)
                 if command_reply_to and "reply_to" not in kwargs:
                     kwargs["reply_to"] = command_reply_to
                 sent_message = await client_inst.send_message(chat_id, message, **kwargs)
@@ -3174,7 +3249,7 @@ async def register_userbot_events(client_inst, owner_id):
                 translation_result = bool(raw_command and raw_command[0] in TRANSLATION_COMMANDS)
                 if not keep_result and not translation_result and not kwargs.get("buttons") and not is_progress:
                     action_commands = {"انتحال", "كشف", "ايدي", "رابط", "الانشاء", "تثبيت", "الغاء", "إلغاء", "كتم"}
-                    wait_seconds = 10 if command_reply_to or (raw_command and raw_command[0] in action_commands) else 4
+                    wait_seconds = int(temporary_seconds) if temporary_seconds is not None else (10 if command_reply_to or (raw_command and raw_command[0] in action_commands) else 4)
                     asyncio.create_task(delete_message_after(sent_message, wait_seconds))
                 return sent_message
 
@@ -3191,9 +3266,25 @@ async def register_userbot_events(client_inst, owner_id):
                     kwargs["reply_to"] = command_reply_to
                 return await client_inst.send_file(chat_id, file, **kwargs)
             
+            # أمر إلغاء موحد: يوضع قبل حالات الإدخال كي لا يُحفظ كنص أو إعداد بالخطأ.
+            if text in (".الغاء", ".إلغاء"):
+                pending_cancelled, stopped_count = await cancel_all_user_operations(client_inst, owner_id)
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                if pending_cancelled or stopped_count:
+                    await command_reply(f"✅ تم الإلغاء بنجاح.\n• تم إلغاء حالة إدخال: {'نعم' if pending_cancelled else 'لا'}\n• العمليات المتوقفة: `{stopped_count}`")
+                else:
+                    await command_reply("ℹ️ لا توجد عملية أو حالة إدخال نشطة لإلغائها.")
+                return
+
             # إدخالات الأوامر اليدوية التي تبدأ في محادثة معينة تبقى فيها.
             pending_local = user_states.get(owner_id)
             if pending_local and pending_local.get("origin_chat_id") == chat_id:
+                # نتجاهل رسالة الطلب التي يرسلها البوت بنفسه حتى لا تُحفظ كنص ترحيب.
+                if pending_local.get("ignore_message_id") == event.id:
+                    return
                 pending_step = pending_local.get("step")
                 if pending_step == "awaiting_welcome_text_local":
                     if not text:
@@ -3215,7 +3306,7 @@ async def register_userbot_events(client_inst, owner_id):
                         return
                     old_photo = user_info.get("welcome_photo")
                     _safe_remove(old_photo)
-                    photo_path = os.path.join(VOICES_DIR, f"welcome_{owner_id}.jpg")
+                    photo_path = os.path.join(TEMP_DIR, f"welcome_{owner_id}.jpg")
                     await client_inst.download_media(event.message, file=photo_path)
                     user_info["welcome_photo"] = photo_path
                     save_data()
@@ -3499,8 +3590,8 @@ async def register_userbot_events(client_inst, owner_id):
                     await event.delete()
                 except Exception:
                     pass
-                user_states[owner_id] = {"step": "awaiting_welcome_text_local", "origin_chat_id": chat_id}
-                await command_reply( "📝 أرسل نص الترحيب الجديد الآن في **نفس هذه المحادثة**:")
+                prompt = await command_reply("📝 أرسل نص الترحيب الجديد الآن في نفس هذه المحادثة:", temporary_seconds=10)
+                user_states[owner_id] = {"step": "awaiting_welcome_text_local", "origin_chat_id": chat_id, "ignore_message_id": prompt.id}
                 return
 
             if text == "تعيين صورة الترحيب":
@@ -3510,8 +3601,8 @@ async def register_userbot_events(client_inst, owner_id):
                     await event.delete()
                 except Exception:
                     pass
-                user_states[owner_id] = {"step": "awaiting_welcome_photo_local", "origin_chat_id": chat_id}
-                await command_reply( "🖼️ أرسل صورة الترحيب الجديدة الآن في **نفس هذه المحادثة**:")
+                prompt = await command_reply("🖼️ أرسل صورة الترحيب الجديدة الآن في نفس هذه المحادثة:", temporary_seconds=10)
+                user_states[owner_id] = {"step": "awaiting_welcome_photo_local", "origin_chat_id": chat_id, "ignore_message_id": prompt.id}
                 return
 
             if text == "حذف صورة الترحيب":
@@ -3750,22 +3841,35 @@ async def register_userbot_events(client_inst, owner_id):
                     pass
                 return
 
-            if text == "تفعيل الذاتيه":
+            if text in ("تفعيل الذاتيه", "تعطيل الذاتيه"):
                 if not is_source_subscribed(owner_id):
                     return
-                user_info["self_save_enabled"] = True
-                save_data()
-                await event.delete()
-                await command_reply( "✅ تم تفعيل حفظ الذاتية التلقائي.")
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                await command_reply(f"✅ حفظ الذاتية تلقائي دائماً. الوجهة الحالية: **{self_save_destination_text(owner_id)}**.")
                 return
 
-            if text == "تعطيل الذاتيه":
+            if text == "انشاء مجموعة الذاتيه":
                 if not is_source_subscribed(owner_id):
                     return
-                user_info["self_save_enabled"] = False
-                save_data()
-                await event.delete()
-                await command_reply( "✅ تم تعطيل حفظ الذاتية التلقائي.")
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                try:
+                    result = await client_inst(CreateChannelRequest(
+                        title="مجموعة الذاتية",
+                        about="لحفظ الوسائط الذاتية تلقائياً عبر بوت ديمون.",
+                        megagroup=True,
+                    ))
+                    target_chat = result.chats[0]
+                    user_info["self_save_chat_id"] = target_chat.id
+                    save_data()
+                    await command_reply(f"✅ تم إنشاء وتعيين مجموعة الذاتية بنجاح.\n• الآيدي: `{target_chat.id}`\n• ستُحفظ فيها الوسائط الذاتية القادمة في الخاص.")
+                except Exception as e:
+                    await command_reply(f"❌ تعذر إنشاء مجموعة الذاتية:\n`{e}`")
                 return
 
             if text.startswith("تعيين مجموعة الذاتيه"):
@@ -3779,9 +3883,9 @@ async def register_userbot_events(client_inst, owner_id):
                     user_info["self_save_chat_id"] = target_chat.id
                     save_data()
                     await event.delete()
-                    await command_reply( f"✅ تم تعيين مجموعة الذاتية: `{target_chat.id}`")
+                    await command_reply(f"✅ تم تعيين مجموعة الذاتية: `{target_chat.id}`\n• ستُحفظ فيها الوسائط الذاتية القادمة في الخاص.")
                 except Exception as e:
-                    await command_reply( f"❌ تعذر تعيين مجموعة الذاتية:\n`{e}`")
+                    await command_reply(f"❌ تعذر تعيين مجموعة الذاتية:\n`{e}`")
                 return
 
             if text == "حذف مجموعة الذاتيه":
@@ -3790,7 +3894,7 @@ async def register_userbot_events(client_inst, owner_id):
                 user_info["self_save_chat_id"] = None
                 save_data()
                 await event.delete()
-                await command_reply( "✅ تم حذف مجموعة الذاتية، وسيتم الحفظ في الرسائل المحفوظة.")
+                await command_reply(f"✅ تم حذف مجموعة الذاتية. الوجهة الحالية: **{self_save_destination_text(owner_id)}**.")
                 return
 
             if text == "ذاتيه":
@@ -4393,17 +4497,20 @@ async def register_userbot_events(client_inst, owner_id):
                         except Exception:
                             pass
 
-            # --- حفظ الذاتية التلقائي للوسائط ذاتية التدمير ---
-            if is_source_subscribed(owner_id) and user_info.get("self_save_enabled", False):
+            # --- حفظ الذاتية التلقائي: الوسائط المؤقتة الواردة في الخاص فقط ---
+            self_destruct_private_media = False
+            if is_source_subscribed(owner_id):
                 try:
                     ttl_value = getattr(event.message, "ttl_period", None) or getattr(event.media, "ttl_seconds", None)
-                    if event.media and ttl_value:
+                    self_destruct_private_media = bool(event.is_private and sender_id != me.id and event.media and ttl_value)
+                    if self_destruct_private_media:
                         await save_media_to_self_destination(client_inst, owner_id, event.message)
                 except Exception as e:
                     print(f"Self-save error: {e}")
 
             # --- مجموعة التخزين: بطاقة واحدة للمصدر الحالي، ثم تحويل الرسائل حتى يصل مصدر مختلف ---
-            if is_source_subscribed(owner_id) and user_info.get("storage_groups"):
+            # الوسيط الذاتي في الخاص تم حفظه للتو عبر وجهة الذاتية، فلا نكرره هنا.
+            if is_source_subscribed(owner_id) and user_info.get("storage_groups") and not self_destruct_private_media:
                 storage_group_id = user_info["storage_groups"][-1]
                 is_private_msg = event.is_private and sender_id != me.id and sender_id not in manager_bot_id
                 is_reply_to_me = False
@@ -4662,7 +4769,7 @@ def tools_back_keyboard():
 def account_section_keyboard():
     return [
         [Button.inline("📊 الاحصائيات", b"stats_menu"), Button.inline("📂 بياناتي", b"my_data_menu")],
-        [Button.inline("💬 قروباتي وقنواتي", b"stats_menu"), Button.inline("🎭 الانتحال", b"clone_menu")],
+        [Button.inline("💬 قروباتي وقنواتي", b"chat_lists_menu"), Button.inline("🎭 الانتحال", b"clone_menu")],
         [Button.inline("🚶 المغادرة والتصفية", b"leave_cleanup_menu"), Button.inline("📆 تاريخ الإنشاء", b"creation_info")],
         [Button.inline("💳 الأيدي", b"id_menu")],
         [Button.inline("◀️ رجوع", b"source_features_menu")]
@@ -4674,7 +4781,19 @@ def welcome_section_keyboard():
 
 
 def self_save_section_keyboard():
-    return [[Button.inline("🧧 حفظ الذاتية", b"self_save_menu")], [Button.inline("◀️ رجوع", b"source_features_menu")]]
+    return [
+        [Button.inline("🧧 حفظ الذاتية", b"self_save_menu"), Button.inline("🧩 محتوى مقيد", b"restricted_menu")],
+        [Button.inline("◀️ رجوع", b"source_features_menu")],
+    ]
+
+
+def chat_lists_keyboard():
+    return [
+        [Button.inline("💬 قروباتي", b"chat_list_groups_all"), Button.inline("📢 قنواتي", b"chat_list_channels_all")],
+        [Button.inline("👑 قروباتي مالك", b"chat_list_groups_owner"), Button.inline("👑 قنواتي مالك", b"chat_list_channels_owner")],
+        [Button.inline("🛡️ قروباتي أدمن", b"chat_list_groups_admin"), Button.inline("🛡️ قنواتي أدمن", b"chat_list_channels_admin")],
+        [Button.inline("◀️ رجوع", b"section_account")],
+    ]
 
 
 def publish_section_keyboard():
@@ -4686,7 +4805,7 @@ def download_section_keyboard():
         [Button.inline("🔴 أوامر اليوتيوب", b"youtube_menu")],
         [Button.inline("⚪ تيك توك", b"tiktok_menu"), Button.inline("🩸 انستغرام", b"instagram_menu")],
         [Button.inline("📌 بنترست", b"pinterest_menu"), Button.inline("📥 تحميل ستوري", b"story_menu")],
-        [Button.inline("🧩 محتوى مقيد", b"restricted_menu"), Button.inline("📦 مستودع GitHub", b"github_menu")],
+        [Button.inline("📦 مستودع GitHub", b"github_menu")],
         [Button.inline("◀️ رجوع", b"source_features_menu")]
     ]
 
@@ -5355,6 +5474,7 @@ async def callback_handler(event):
             return
         user_states[user_id] = {"step": "awaiting_welcome_text"}
         await event.edit("📝 أرسل نص الترحيب الجديد الآن:", buttons=[[Button.inline("🔙 رجوع", b"welcome_menu")]])
+        asyncio.create_task(delete_message_after(event.message, 10))
 
     elif data == b"set_welcome_photo":
         if not is_source_subscribed(user_id):
@@ -5362,6 +5482,7 @@ async def callback_handler(event):
             return
         user_states[user_id] = {"step": "awaiting_welcome_photo"}
         await event.edit("🖼️ أرسل صورة الترحيب الآن:", buttons=[[Button.inline("🔙 رجوع", b"welcome_menu")]])
+        asyncio.create_task(delete_message_after(event.message, 10))
 
     elif data == b"delete_welcome_photo":
         if not is_source_subscribed(user_id):
@@ -5582,6 +5703,30 @@ async def callback_handler(event):
             return
         await event.edit(STATS_GUIDE, buttons=[[Button.inline("🔙 رجوع", b"section_account")]])
 
+    elif data == b"chat_lists_menu":
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        await event.edit("💬 **قروباتي وقنواتي**\n\nاختر القائمة التي تريد عرضها.", buttons=chat_lists_keyboard())
+
+    elif data.startswith(b"chat_list_"):
+        if not is_source_subscribed(user_id):
+            await event.answer(source_lock_message(), alert=True)
+            return
+        client = user_clients.get(user_id)
+        if not client:
+            await event.answer("⚠️ يرجى تسجيل الدخول بحسابك أولاً.", alert=True)
+            return
+        try:
+            _, _, category, mode = data.decode().split("_", 3)
+            groups, channels = await get_account_chat_lists(client, mode)
+            is_groups = category == "groups"
+            title = "قروباتي" if is_groups else "قنواتي"
+            mode_label = {"all": "الكل", "owner": "مالك", "admin": "أدمن"}.get(mode, "الكل")
+            await event.edit(format_account_chat_list(groups if is_groups else channels, title, mode_label), buttons=[[Button.inline("🔙 رجوع", b"chat_lists_menu")]])
+        except Exception as e:
+            await event.edit(f"❌ تعذر جلب القائمة:\n`{e}`", buttons=[[Button.inline("🔙 رجوع", b"chat_lists_menu")]])
+
     elif data in [b"section_account", b"section_welcome", b"section_self_save", b"section_publish", b"section_download", b"section_tools"]:
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
@@ -5613,7 +5758,12 @@ async def callback_handler(event):
             b"broadcast_menu": BROADCAST_GUIDE,
             b"leave_cleanup_menu": LEAVE_CLEANUP_GUIDE
         }
-        buttons = tools_back_keyboard() if data == b"writing_menu" else [[Button.inline("◀️ رجوع", b"section_download")]]
+        if data == b"writing_menu":
+            buttons = tools_back_keyboard()
+        elif data == b"restricted_menu":
+            buttons = [[Button.inline("◀️ رجوع", b"section_self_save")]]
+        else:
+            buttons = [[Button.inline("◀️ رجوع", b"section_download")]]
         await event.edit(guide_map[data], buttons=buttons)
 
     elif data == b"calculator_menu":
@@ -6899,6 +7049,15 @@ async def message_input_handler(event):
     user_id = event.sender_id
     text = event.raw_text.strip() if event.raw_text else ""
 
+    # يعمل في خاص بوت الإدارة أيضاً لإلغاء طلبات النصوص أو الصور أو الأرقام المفتوحة.
+    if text in (".الغاء", ".إلغاء"):
+        pending_cancelled, stopped_count = await cancel_all_user_operations(user_clients.get(user_id), user_id)
+        if pending_cancelled or stopped_count:
+            await event.respond(f"✅ تم الإلغاء بنجاح.\n• تم إلغاء حالة إدخال: {'نعم' if pending_cancelled else 'لا'}\n• العمليات المتوقفة: `{stopped_count}`")
+        else:
+            await event.respond("ℹ️ لا توجد عملية أو حالة إدخال نشطة لإلغائها.")
+        return
+
     # التفعيل الفوري في خاص البوت: لا يحتاج المستخدم للضغط على أي زر.
     # يعالج فقط صيغة أكواد ديمون كي لا يرد على الرسائل العادية.
     if text and re.fullmatch(r"(?:PBL|SRC|ALL)-[A-Za-z0-9_-]+", text, flags=re.IGNORECASE):
@@ -7091,7 +7250,7 @@ async def message_input_handler(event):
             return
         old_photo = users_db[user_id].get("welcome_photo")
         _safe_remove(old_photo)
-        photo_path = os.path.join(VOICES_DIR, f"welcome_{user_id}.jpg")
+        photo_path = os.path.join(TEMP_DIR, f"welcome_{user_id}.jpg")
         await event.download_media(photo_path)
         users_db[user_id]["welcome_photo"] = photo_path
         save_data()
