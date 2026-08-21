@@ -30,7 +30,7 @@ from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotos
 from telethon.tl.types import (
     MessageEntityCustomEmoji,
     ChatBannedRights, ChannelParticipantCreator, ChannelParticipantAdmin,
-    DocumentAttributeSticker, InputStickerSetEmpty, EmojiStatus, EmojiStatusEmpty,
+    DocumentAttributeSticker, InputStickerSetEmpty, InputUser, EmojiStatus, EmojiStatusEmpty,
     EmojiStatusCollectible, PeerColor, Birthday, BusinessLocation, BusinessWorkHours,
     BusinessWeeklyOpen, InputGeoPoint
 )
@@ -195,17 +195,12 @@ def _utf16_length(value):
 def build_damon_welcome_message():
     """ترحيب Damon المطلوب مع رموز عادية احتياطية وكيانات مميزة في مواضع صحيحة."""
     welcome_text = (
-        "مرحبًا بك في بوت Damon 🤩\n\n"
-        "#PureValley @PureVaIIey ✨\n"
-        "#Nardouv @Nardouv 👑\n"
-        "#S6am @S_Z_7z 🤖\n\n"
+        "مرحبًا بك في بوت Damon 👑\n\n"
         "أزرار التحكم بالأسفل 👇:"
     )
     custom_icons = {
-        "🤩": OWNER_PREMIUM_EMOJI_ID,
-        "✨": PREMIUM_EMOJI_IDS["✨"],
-        "👑": PREMIUM_EMOJI_IDS["👑"],
-        "🤖": PREMIUM_EMOJI_IDS["🤖"],
+        # نفس إيموجي Nardouv الحصري، مع رمز 👑 عادي كبديل في العملاء غير الداعمة.
+        "👑": OWNER_PREMIUM_EMOJI_ID,
         "👇": 5470177992950946662,
     }
     entities = []
@@ -5635,11 +5630,78 @@ def admin_fardiyyat_menu_keyboard():
     ]
 
 # ==================== Bot Event Handlers ====================
+WELCOME_PHOTO_CAPTION_MARKER = "مرحبًا بك في بوت"
+
+
+async def send_dynamic_profile_welcome(event, user_id, welcome_txt, welcome_entities):
+    """يرسل صورة الحساب الحالية مع نص وأزرار /start في رسالة واحدة."""
+    buttons = main_menu_keyboard(user_id)
+    try:
+        # نستدعي أحدث صورة للمالك مباشرة من Telegram ونرسل مرجعها، بلا تنزيل أو رفع جديد.
+        owner_profile = await bot.get_entity(OWNER_ID)
+        owner_input = InputUser(owner_profile.id, owner_profile.access_hash)
+        photos_result = await bot(GetUserPhotosRequest(owner_input, offset=0, max_id=0, limit=1))
+        welcome_photo = next((photo for photo in getattr(photos_result, "photos", []) if getattr(photo, "access_hash", None)), None)
+        if welcome_photo:
+            try:
+                return await bot.send_file(
+                    event.chat_id,
+                    welcome_photo,
+                    caption=welcome_txt,
+                    buttons=buttons,
+                    parse_mode=None,
+                    formatting_entities=welcome_entities,
+                )
+            except Exception as emoji_error:
+                # تظل الصورة موجودة حتى لو تعذر إرفاق الإيموجي المميز في caption.
+                print(f"[WELCOME PHOTO EMOJI FALLBACK] {emoji_error}")
+                return await bot.send_file(
+                    event.chat_id,
+                    welcome_photo,
+                    caption=welcome_txt,
+                    buttons=buttons,
+                )
+    except Exception as photo_error:
+        print(f"[WELCOME PROFILE PHOTO FALLBACK] {photo_error}")
+
+    # إذا لم تكن للحساب صورة حالية أو تعذر تحميلها، يظهر الترحيب النصي المعتاد.
+    try:
+        return await event.respond(
+            welcome_txt,
+            buttons=buttons,
+            link_preview=False,
+            parse_mode=None,
+            formatting_entities=welcome_entities,
+        )
+    except Exception as welcome_error:
+        print(f"[WELCOME EMOJI FALLBACK] {welcome_error}")
+        return await event.respond(welcome_txt, buttons=buttons, link_preview=False)
+
+
+async def replace_welcome_photo_with_text_menu(event):
+    """يحذف ترحيب /start المصور مرة واحدة، ثم يحوّل نفس التنقل إلى رسالة نصية."""
+    try:
+        original = await event.get_message()
+        caption = str(getattr(original, "raw_text", "") or getattr(original, "message", "") or "")
+        if not original or not getattr(original, "photo", None) or WELCOME_PHOTO_CAPTION_MARKER not in caption:
+            return False
+
+        # رسالة انتقال غير مرئية تُحرر موضعاً للقائمة النصية الجديدة، فلا يظهر للمستخدم أي نص انتظار.
+        replacement = await bot.send_message(event.chat_id, "\u2063", link_preview=False)
+        await bot.delete_messages(event.chat_id, [original.id])
+        # تجعل كل event.edit لاحق في الفرع الحالي يعدّل رسالة النص الجديدة بدل رسالة الصورة المحذوفة.
+        event.query.msg_id = replacement.id
+        event._message = replacement
+        return True
+    except Exception as exc:
+        print(f"[WELCOME PHOTO REPLACE ERROR] {exc}")
+        return False
+
+
 @bot.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     user_id = event.sender_id
     init_user_db(user_id)
-    
     args = event.text.split()
     if len(args) > 1:
         code = args[1].strip()
@@ -5657,20 +5719,8 @@ async def start_handler(event):
                 else:
                     await report_admin_error("كود تفعيل غير صالح", "محاولة كود غير صالح أو مستخدم", user_id)
                     await event.respond("❌ رمز التفعيل غير صالح أو تم استخدامه سابقاً.")
-
     welcome_txt, welcome_entities = build_damon_welcome_message()
-    try:
-        await event.respond(
-            welcome_txt,
-            buttons=main_menu_keyboard(user_id),
-            link_preview=False,
-            parse_mode=None,
-            formatting_entities=welcome_entities,
-        )
-    except Exception as welcome_error:
-        # لا تسمح لزينة الواجهة أن تمنع /start: النص العادي والأزرار يظهران دائماً.
-        print(f"[WELCOME EMOJI FALLBACK] {welcome_error}")
-        await event.respond(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
+    await send_dynamic_profile_welcome(event, user_id, welcome_txt, welcome_entities)
 
 
 # ==================== AI Section: smooth in-place navigation ====================
@@ -5744,6 +5794,8 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = event.data
     init_user_db(user_id)
+    # إذا كان الزر من ترحيب /start المصور، نحذفه أولاً ثم يكمل الفرع الحالي على قائمة نصية.
+    await replace_welcome_photo_with_text_menu(event)
     track_menu_navigation(user_id, data)
 
     if data in OWNER_ONLY_CALLBACKS and not is_owner(user_id):
