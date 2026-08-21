@@ -28,11 +28,241 @@ from telethon.tl.functions.account import (
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.photos import UploadProfilePhotoRequest, DeletePhotosRequest, GetUserPhotosRequest
 from telethon.tl.types import (
+    MessageEntityCustomEmoji,
     ChatBannedRights, ChannelParticipantCreator, ChannelParticipantAdmin,
     DocumentAttributeSticker, InputStickerSetEmpty, EmojiStatus, EmojiStatusEmpty,
     EmojiStatusCollectible, PeerColor, Birthday, BusinessLocation, BusinessWorkHours,
     BusinessWeeklyOpen, InputGeoPoint
 )
+
+
+# ==================== Telegram Premium Emoji UI ====================
+# المعرّفات تخص إيموجيات تيليجرام مميزة عامة؛ يظهر الرمز قبل عنوان الزر في عملاء Telegram الداعمة.
+PREMIUM_EMOJI_IDS = {
+    "⏳": 5451732530048802485,
+    "📥": 5433811242135331842,
+    "🔍": 5188217332748527444,
+    "🤖": 5372981976804366741,
+    "🎙": 5382013970905309819,
+    "✅": 5427009714745517609,
+    "❌": 5465665476971471368,
+    "📖": 5226512880362332956,
+    "📊": 5431577498364158238,
+    "🧠": 5237799019329105246,
+    "🖼": 5375074927252621134,
+    "👤": 5373012449597335010,
+    "👥": 5372926953978341366,
+    "👑": 5467406098367521267,
+    "🔄": 5264727218734524899,
+    "➕": 5226945370684140473,
+    "✏": 5334673106202010226,
+    "🔗": 5375129357373165375,
+    "📂": 5431721976769027887,
+    "📬": 5350421256627838238,
+    "📱": 5407025283456835913,
+    "🎟": 5377599075237502153,
+    "🎭": 5359441070201513074,
+    "🎯": 5350460637182993292,
+    "💬": 5465300082628763143,
+    "✨": 5472164874886846699,
+    "🚀": 5445284980978621387,
+    "🎤": 5382360961313152917,
+    "🔑": 5330115548900501467,
+    "⚡": 5431449001532594346,
+    "⭐": 5435957248314579621,
+    "📣": 5469903029144657419,
+}
+
+# رموز لا يوجد لها بديل مباشر في الحزمة المستخدمة؛ نربطها بعلامة مميزة متقاربة.
+PREMIUM_ICON_ALIASES = {
+    "🔙": "👈", "◀": "👈", "↩": "👈",
+    "🗑": "❌", "⚠": "❌", "🛑": "❌", "⏹": "❌", "🔇": "❌",
+    "⏱": "⏳", "⌛": "⏳", "📋": "📖", "📜": "📖",
+    "📦": "📥", "📌": "🔗", "📍": "🔗", "📢": "📣",
+    "▶": "🚀", "🎧": "🎙", "🖼️": "🖼", "💾": "📂",
+    "🛡": "👑", "💳": "👤", "⚙": "🧠", "🧩": "🧠",
+    "🧰": "🧠", "🧹": "✨", "🔢": "📊", "🔘": "🔍",
+    "🩸": "✨", "🔴": "❌", "⚪": "✨", "🏧": "📖", "📟": "📊",
+    "🏷": "🎟", "🚶": "👤", "📅": "📊", "🔊": "🎙",
+}
+PREMIUM_EMOJI_IDS["👈"] = 5469735272017043817
+# أول ملصق من حزمة الريس التي حددها المستخدم: hell @TgEmodziBot.
+OWNER_PREMIUM_EMOJI_ID = 5003588413954197329
+PREMIUM_DEFAULT_SYMBOL = "✨"
+PREMIUM_DEFAULT_ICON_ID = PREMIUM_EMOJI_IDS[PREMIUM_DEFAULT_SYMBOL]
+
+
+def _premium_icon_for_text(text):
+    """يعيد الرمز الأصلي ومعرف الإيموجي المميز المناسب للنص."""
+    value = str(text or "").lstrip()
+    for symbol in sorted(PREMIUM_EMOJI_IDS, key=len, reverse=True):
+        if value.startswith(symbol) or value.startswith(symbol + "️"):
+            return symbol, PREMIUM_EMOJI_IDS[symbol]
+    for symbol, alias in PREMIUM_ICON_ALIASES.items():
+        if value.startswith(symbol) or value.startswith(symbol + "️"):
+            return symbol, PREMIUM_EMOJI_IDS[alias]
+    return None, None
+
+
+def _strip_leading_ui_symbol(text, symbol):
+    if not symbol:
+        return str(text or "")
+    value = str(text or "").lstrip()
+    if value.startswith(symbol):
+        value = value[len(symbol):]
+        if value.startswith("️"):
+            value = value[1:]
+    return value.lstrip()
+
+
+# icon في KeyboardButtonStyle يظهر قبل تسمية الزر؛ لذلك يكون على يسار الاسم كما طلب المستخدم.
+_ORIGINAL_BUTTON_INLINE = Button.inline
+
+def _premium_inline_button(text, data=None, style=None, icon=None):
+    original_text = str(text)
+    symbol, custom_icon_id = _premium_icon_for_text(original_text)
+    if icon is None:
+        # حتى الأزرار التي لا تحمل إيموجي تحصل على علامة مميزة افتراضية.
+        custom_icon_id = custom_icon_id or PREMIUM_DEFAULT_ICON_ID
+        text = _strip_leading_ui_symbol(original_text, symbol) if symbol else original_text
+        icon = custom_icon_id
+    # عندما لا يحدد الزر data نحافظ على بياناته الأصلية رغم تنظيف النص الظاهر.
+    if data is None:
+        data = original_text
+    return _ORIGINAL_BUTTON_INLINE(text, data=data, style=style, icon=icon)
+
+
+_ORIGINAL_BUTTON_URL = Button.url
+
+def _premium_url_button(text, url=None, style=None, icon=None):
+    original_text = str(text)
+    symbol, custom_icon_id = _premium_icon_for_text(original_text)
+    # زر الريس حصرياً يأخذ أول ملصق من الحزمة التي أرسلها المستخدم.
+    if "الريس" in original_text:
+        custom_icon_id = OWNER_PREMIUM_EMOJI_ID
+    if icon is None:
+        text = _strip_leading_ui_symbol(original_text, symbol) if symbol else original_text
+        icon = custom_icon_id or PREMIUM_DEFAULT_ICON_ID
+    return _ORIGINAL_BUTTON_URL(text, url=url, style=style, icon=icon)
+
+
+Button.inline = staticmethod(_premium_inline_button)
+Button.url = staticmethod(_premium_url_button)
+
+
+# تغليف مركزي لرسائل اليوزر بوت اليدوية، بما فيها الردود المعدلة بعد بدء الأمر.
+_ORIGINAL_CLIENT_SEND_MESSAGE = TelegramClient.send_message
+_ORIGINAL_CLIENT_EDIT_MESSAGE = TelegramClient.edit_message
+
+
+def _is_manager_bot_client(client):
+    return client is globals().get("bot")
+
+
+def _premium_outgoing_text_payload(message, kwargs):
+    if not isinstance(message, str) or not message.strip() or kwargs.get("formatting_entities"):
+        return message, kwargs
+    decorated, entities = prepare_premium_command_message(message)
+    if entities:
+        kwargs = dict(kwargs)
+        kwargs["formatting_entities"] = entities
+        kwargs["parse_mode"] = None
+    return decorated, kwargs
+
+
+async def _premium_client_send_message(self, entity, message="", *args, **kwargs):
+    if not _is_manager_bot_client(self):
+        message, kwargs = _premium_outgoing_text_payload(message, kwargs)
+    return await _ORIGINAL_CLIENT_SEND_MESSAGE(self, entity, message, *args, **kwargs)
+
+
+async def _premium_client_edit_message(self, entity, message=None, text=None, *args, **kwargs):
+    if not _is_manager_bot_client(self):
+        if text is not None:
+            text, kwargs = _premium_outgoing_text_payload(text, kwargs)
+        elif isinstance(message, str):
+            message, kwargs = _premium_outgoing_text_payload(message, kwargs)
+    return await _ORIGINAL_CLIENT_EDIT_MESSAGE(self, entity, message, text=text, *args, **kwargs)
+
+
+TelegramClient.send_message = _premium_client_send_message
+TelegramClient.edit_message = _premium_client_edit_message
+
+def _utf16_length(value):
+    return len(str(value).encode("utf-16-le")) // 2
+
+
+def build_damon_welcome_message():
+    """ترحيب Damon المطلوب مع رموز عادية احتياطية وكيانات مميزة في مواضع صحيحة."""
+    welcome_text = (
+        "مرحبًا بك في بوت Damon 🤩\n\n"
+        "#PureValley @PureVaIIey ✨\n"
+        "#Nardouv @Nardouv 👑\n"
+        "#S6am @S_Z_7z 🤖\n\n"
+        "أزرار التحكم بالأسفل 👇:"
+    )
+    custom_icons = {
+        "🤩": OWNER_PREMIUM_EMOJI_ID,
+        "✨": PREMIUM_EMOJI_IDS["✨"],
+        "👑": PREMIUM_EMOJI_IDS["👑"],
+        "🤖": PREMIUM_EMOJI_IDS["🤖"],
+        "👇": 5470177992950946662,
+    }
+    entities = []
+    cursor = 0
+    for char in welcome_text:
+        char_length = _utf16_length(char)
+        if char in custom_icons:
+            entities.append(MessageEntityCustomEmoji(
+                offset=cursor,
+                length=char_length,
+                document_id=custom_icons[char],
+            ))
+        cursor += char_length
+    return welcome_text, entities
+
+
+def prepare_premium_command_message(message):
+    """يضيف إيموجي مميزاً في نهاية النص العربي ليظهر بصرياً على اليسار."""
+    if not isinstance(message, str) or not message.strip():
+        return message, None
+    raw = message
+    symbol, emoji_id = _premium_icon_for_text(raw)
+    if not emoji_id:
+        normalized = raw.lstrip()
+        if any(token in normalized for token in ("جاري التحميل", "تم تحميل", "تحميل")):
+            symbol, emoji_id = "📥", PREMIUM_EMOJI_IDS["📥"]
+        elif any(token in normalized for token in ("جاري البحث", "بحث", "جاري فهم")):
+            symbol, emoji_id = "🔍", PREMIUM_EMOJI_IDS["🔍"]
+        elif any(token in normalized for token in ("جاري توليد", "الفويس", "الصوت")):
+            symbol, emoji_id = "🎙", PREMIUM_EMOJI_IDS["🎙"]
+        elif any(token in normalized for token in ("جاري التفكير", "الذكاء الاصطناعي")):
+            symbol, emoji_id = "🤖", PREMIUM_EMOJI_IDS["🤖"]
+        elif any(token in normalized for token in ("تم ", "بنجاح")):
+            symbol, emoji_id = "✅", PREMIUM_EMOJI_IDS["✅"]
+        elif any(token in normalized for token in ("تعذر", "فشل", "خطأ", "غير صالح")):
+            symbol, emoji_id = "❌", PREMIUM_EMOJI_IDS["❌"]
+        elif any(token in normalized for token in ("تحذير", "انتبه")):
+            symbol, emoji_id = "❌", PREMIUM_EMOJI_IDS["❌"]
+    if not emoji_id:
+        # تغطية شاملة للردود اليدوية التي لا تملك كلمة مفتاحية معروفة.
+        symbol, emoji_id = PREMIUM_DEFAULT_SYMBOL, PREMIUM_DEFAULT_ICON_ID
+
+    # نحذف الإيموجي العادي من بداية النص ثم نضع أساس الإيموجي في النهاية؛ entity يحوله إلى مميز.
+    clean = _strip_leading_ui_symbol(raw, symbol)
+    try:
+        from telethon.extensions import markdown
+        parsed_text, entities = markdown.parse(clean)
+    except Exception:
+        parsed_text, entities = clean, []
+    decorated = f"{parsed_text} {symbol}"
+    entities = list(entities or [])
+    entities.append(MessageEntityCustomEmoji(
+        offset=_utf16_length(parsed_text + " "),
+        length=_utf16_length(symbol),
+        document_id=emoji_id,
+    ))
+    return decorated, entities
 
 # ==================== Configuration ====================
 API_ID = 39686732
@@ -48,7 +278,7 @@ ADMIN_IDS = [520859814]
 # رابط المطور وقناة البوت
 DEV_URL = "https://t.me/Nardouv"
 CHANNEL_URL = "https://t.me/PabloBot666"
-DEVELOPERS = [{"username": "Nardouv"}]
+DEVELOPERS = [{"username": "Nardouv", "display_name": "Nardouv"}]
 
 # ملفات البيانات والجلسات. عيّن PERSISTENT_DATA_DIR لمسار القرص الدائم في السيرفر.
 # إذا لم يضبط المتغير، تعمل الملفات محلياً في مجلد المشروع كالمعتاد.
@@ -90,6 +320,8 @@ users_db = {}
 user_clients = {}
 user_states = {}
 search_cache = {}
+hybrid_download_cache = {}
+_gemini_hybrid_unavailable_until = 0.0
 
 # القوائم الأساسية العامة (تدار عبر لوحة الأدمن وتنعكس للجميع)
 default_tastir = []
@@ -142,7 +374,7 @@ def track_menu_navigation(user_id, callback_data):
     menu_callbacks = {
         b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"nick_am_menu", b"speed_menu",
         b"source_features_menu", b"flush_section", b"flush_menu", b"mute_menu", b"voice_menu", b"clone_menu", b"welcome_menu",
-        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu",
+        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"ai_main_menu", b"ai_chat_help", b"ai_voices_help", b"admin_menu", b"admin_users_menu", b"admin_admins_menu",
         b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu",
     }
     if callback_data == b"main_menu":
@@ -182,18 +414,43 @@ def developer_url(item):
     return f"https://t.me/{username}" if username else DEV_URL
 
 
+def developer_display_name(item):
+    """يعرض اسم الحساب الذي اختاره صاحبه، مع بديل اليوزر عند غياب الاسم."""
+    if not isinstance(item, dict):
+        return str(item or "المطور")
+    name = str(item.get("display_name", "")).strip()
+    if name:
+        return name[:64]
+    username = str(item.get("username", "")).strip().lstrip("@")
+    return username or "المطور"
+
+
+async def resolve_developer_display_name(username):
+    """يجلب الاسم الظاهر مرة عند الإضافة أو التغيير، ثم يحفظه للعرض السريع لاحقاً."""
+    fallback = str(username or "").strip().lstrip("@") or "المطور"
+    try:
+        entity = await bot.get_entity(f"@{fallback}")
+        first_name = str(getattr(entity, "first_name", "") or "").strip()
+        last_name = str(getattr(entity, "last_name", "") or "").strip()
+        title = str(getattr(entity, "title", "") or "").strip()
+        full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+        return (full_name or title or fallback)[:64]
+    except Exception:
+        return fallback[:64]
+
+
 def developer_main_buttons():
-    """يرتب أزرار الاتصال: الريس يميناً والقناة يساراً، ثم المطورون والقناة أسفلهم عند الإضافة."""
-    visible = DEVELOPERS[:3] or [{"username": "Nardouv"}]
-    owner_button = Button.url("👑 الريس", developer_url(visible[0]))
+    """يرتب أزرار الاتصال بأسماء الحسابات؛ Nardouv يحتفظ بملصقه المميز."""
+    visible = DEVELOPERS[:3] or [{"username": "Nardouv", "display_name": "Nardouv"}]
+    owner_name = developer_display_name(visible[0]) or "Nardouv"
+    owner_button = Button.url(owner_name, developer_url(visible[0]), icon=OWNER_PREMIUM_EMOJI_ID)
     channel_button = Button.url("📢 قناة البوت", CHANNEL_URL)
     if len(visible) == 1:
-        # ترتيب الزرين هنا: القناة يسار والريس يمين.
         return [[channel_button, owner_button]]
 
-    rows = [[owner_button, Button.url("👨‍💻 المطور 2", developer_url(visible[1]))]]
+    rows = [[owner_button, Button.url(developer_display_name(visible[1]), developer_url(visible[1]))]]
     if len(visible) >= 3:
-        rows.append([Button.url("👨‍💻 المطور 3", developer_url(visible[2]))])
+        rows.append([Button.url(developer_display_name(visible[2]), developer_url(visible[2]))])
     rows.append([channel_button])
     return rows
 
@@ -286,8 +543,9 @@ def load_data():
                     normalized_developers = []
                     for item in saved_developers:
                         username = normalize_telegram_username(item.get("username", "") if isinstance(item, dict) else item)
+                        display_name = str(item.get("display_name", "") if isinstance(item, dict) else "").strip()
                         if username and username.lower() not in [entry["username"].lower() for entry in normalized_developers]:
-                            normalized_developers.append({"username": username})
+                            normalized_developers.append({"username": username, "display_name": (display_name or username)[:64]})
                     if normalized_developers:
                         DEVELOPERS = normalized_developers
                         DEV_URL = developer_url(DEVELOPERS[0])
@@ -860,86 +1118,191 @@ async def apply_full_activation_code(user_id, code, event):
     return True, days
 
 
+async def resolve_hybrid_download_request(raw_request, default_audio=False):
+    """يفهم Gemini طلب الوسائط عند توافره، ثم يعيد استعلاماً آمناً لـ yt-dlp.
+
+    لا يتعامل Gemini مع تنزيل الملفات؛ دوره يقتصر على فهم عبارة البحث. عند انتهاء حصته
+    أو حدوث أي خطأ نعود فوراً للاستعلام الأصلي، كي لا يتعطل التحميل المعتاد.
+    """
+    global _gemini_hybrid_unavailable_until
+
+    request_text = " ".join(str(raw_request or "").split()).strip()
+    if not request_text:
+        raise ValueError("اكتب اسم المقطع أو أرسل رابطاً صحيحاً.")
+
+    # الرابط المباشر لا يحتاج ذكاءً اصطناعياً ولا نضيف له أي زمن انتظار.
+    if re.match(r"^(?:https?://|www\.)", request_text, flags=re.IGNORECASE):
+        return {
+            "search_query": request_text,
+            "audio_only": bool(default_audio),
+            "is_direct_url": True,
+            "used_gemini": False,
+        }
+
+    cache_key = f"{int(bool(default_audio))}:{request_text.casefold()}"
+    cached = hybrid_download_cache.get(cache_key)
+    if cached and cached.get("expires_at", 0) > time.monotonic():
+        return dict(cached["plan"])
+
+    fallback = {
+        "search_query": request_text[:240],
+        "audio_only": bool(default_audio),
+        "is_direct_url": False,
+        "used_gemini": False,
+    }
+
+    # دائرة حماية: إذا أعادت الخدمة 429 لا نعلق كل طلب جديد بانتظار Gemini.
+    if time.monotonic() < _gemini_hybrid_unavailable_until:
+        return fallback
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return fallback
+
+    prompt = (
+        "حوّل طلب المستخدم إلى استعلام قصير ودقيق للبحث عن مقطع واحد في YouTube. "
+        "أعد JSON فقط من دون Markdown بالشكل: "
+        '{"query":"عنوان مناسب للبحث","audio_only":true أو false}. '
+        "اجعل audio_only=true فقط إذا طلب المستخدم أغنية أو صوتاً أو mp3 أو نطقاً؛ "
+        f"القيمة الافتراضية للصوت هي {str(bool(default_audio)).lower()}. "
+        f"طلب المستخدم: {request_text}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 180},
+    }
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+
+    def _request():
+        return requests.post(url, params={"key": api_key}, json=payload, timeout=10)
+
+    try:
+        response = await asyncio.to_thread(_request)
+        if response.status_code == 200:
+            candidates = response.json().get("candidates", [])
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+            answer = "".join(str(part.get("text", "")) for part in parts).strip()
+            match = re.search(r"\{.*\}", answer, flags=re.DOTALL)
+            parsed = json.loads(match.group(0) if match else answer)
+            query = " ".join(str(parsed.get("query", "")).split()).strip()[:240]
+            if query:
+                plan = {
+                    "search_query": query,
+                    "audio_only": bool(parsed.get("audio_only", default_audio)),
+                    "is_direct_url": False,
+                    "used_gemini": True,
+                }
+                hybrid_download_cache[cache_key] = {
+                    "plan": dict(plan),
+                    "expires_at": time.monotonic() + 900,
+                }
+                if len(hybrid_download_cache) > 120:
+                    hybrid_download_cache.pop(next(iter(hybrid_download_cache)), None)
+                return plan
+        elif response.status_code == 429:
+            # خمس دقائق من المسار العادي تمنع بطء المستخدم عند انتهاء حصة Gemini.
+            _gemini_hybrid_unavailable_until = time.monotonic() + 300
+        else:
+            print(f"[HYBRID GEMINI ERROR] HTTP {response.status_code}")
+    except Exception as exc:
+        print(f"[HYBRID GEMINI ERROR] {exc}")
+
+    return fallback
+
+
+async def hybrid_ytdlp_download(raw_request, default_audio=False):
+    """Gemini للفهم والبحث، وyt-dlp للتنزيل الحقيقي للملف."""
+    plan = await resolve_hybrid_download_request(raw_request, default_audio=default_audio)
+    # أمر «يوت» مخصص للصوت دائماً؛ لا نسمح لمفسر الاستعلام بتحويله إلى فيديو.
+    if default_audio:
+        plan["audio_only"] = True
+    target = plan["search_query"] if plan["is_direct_url"] else f"ytsearch1:{plan['search_query']}"
+    media_path, info = await _ytdlp_download(target, audio_only=plan["audio_only"])
+    return media_path, info, plan
+
+
+def format_media_duration(seconds):
+    """يعرض مدة الوسيط بصيغة واضحة للنتائج."""
+    try:
+        total = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        return "غير معروفة"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def result_channel_name(video_info):
+    """يعيد أفضل اسم قناة متاح من بيانات yt-dlp."""
+    return (
+        video_info.get("channel")
+        or video_info.get("uploader")
+        or video_info.get("creator")
+        or video_info.get("uploader_id")
+        or "قناة يوتيوب"
+    )
+
+
 async def search_and_download_youtube(query):
     cache_key = " ".join(str(query or "").strip().casefold().split())
+
+    def build_result(video_info):
+        if not video_info:
+            return None, None, None, None, None
+        vid = video_info.get("id")
+        title = (video_info.get("title") or "مقطع بدون عنوان").strip()
+        duration = int(video_info.get("duration") or 0)
+        channel = result_channel_name(video_info)
+        file_path = os.path.join(VOICES_DIR, f"{vid}.mp3")
+        if not os.path.exists(file_path):
+            for filename in os.listdir(VOICES_DIR):
+                if str(filename).startswith(str(vid)) and filename.lower().endswith(".mp3"):
+                    file_path = os.path.join(VOICES_DIR, filename)
+                    break
+        thumb_path = None
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            candidate = os.path.join(VOICES_DIR, f"{vid}{ext}")
+            if os.path.exists(candidate):
+                thumb_path = candidate
+                break
+        return file_path, title, duration, channel, thumb_path
+
     def download():
-        if cache_key in search_cache:
-            video_info = search_cache[cache_key]
-            vid = video_info.get('id')
-            title = video_info.get('title', 'Audio')
-            duration = int(video_info.get('duration', 0))
-            uploader = video_info.get('uploader', 'YouTube')
-            
-            file_path = os.path.join(VOICES_DIR, f"{vid}.mp3")
-            if os.path.exists(file_path):
-                thumb_path = None
-                for ext in ['.jpg', '.jpeg', '.png', '.webp']:
-                    tp = os.path.join(VOICES_DIR, f"{vid}{ext}")
-                    if os.path.exists(tp):
-                        thumb_path = tp
-                        break
-                return file_path, title, duration, uploader, thumb_path
+        cached = search_cache.get(cache_key)
+        if cached:
+            file_path, title, duration, channel, thumb_path = build_result(cached)
+            if file_path and os.path.exists(file_path):
+                return file_path, title, duration, channel, thumb_path
 
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'default_search': 'ytsearch1',
-            'socket_timeout': 12,
-            'retries': 2,
-            'fragment_retries': 2,
-            'extractor_retries': 2,
-            'concurrent_fragment_downloads': 4,
-            'http_chunk_size': 10 * 1024 * 1024,
-            'noplaylist': True,
-            'quiet': True,
-            'no_warnings': True,
-            'noprogress': True,
-            'writethumbnail': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web']
-                }
-            },
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',
-            }],
-            'outtmpl': os.path.join(VOICES_DIR, '%(id)s.%(ext)s'),
+            "format": "bestaudio/best",
+            "default_search": "ytsearch1",
+            "socket_timeout": 12,
+            "retries": 2,
+            "fragment_retries": 2,
+            "extractor_retries": 2,
+            "concurrent_fragment_downloads": 4,
+            "http_chunk_size": 10 * 1024 * 1024,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "writethumbnail": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}],
+            "outtmpl": os.path.join(VOICES_DIR, "%(id)s.%(ext)s"),
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            if 'entries' in info:
-                if not info['entries']:
-                    return None, None, None, None, None
-                video_info = info['entries'][0]
-            else:
-                video_info = info
-            
+            entries = info.get("entries") if isinstance(info, dict) else None
+            video_info = entries[0] if entries else info
+            if not video_info:
+                return None, None, None, None, None
             search_cache[cache_key] = video_info
             if len(search_cache) > 120:
-                # نبقي الذاكرة خفيفة مع الاستفادة من أحدث نتائج البحث.
                 search_cache.pop(next(iter(search_cache)), None)
-            
-            vid = video_info.get('id')
-            title = video_info.get('title', 'Audio')
-            duration = int(video_info.get('duration', 0))
-            uploader = video_info.get('uploader', 'YouTube')
-            
-            file_path = os.path.join(VOICES_DIR, f"{vid}.mp3")
-            if not os.path.exists(file_path):
-                for f in os.listdir(VOICES_DIR):
-                    if f.startswith(vid) and f.endswith('.mp3'):
-                        file_path = os.path.join(VOICES_DIR, f)
-                        break
-            
-            thumb_path = None
-            for ext in ['.jpg', '.jpeg', '.png', '.webp']:
-                tp = os.path.join(VOICES_DIR, f"{vid}{ext}")
-                if os.path.exists(tp):
-                    thumb_path = tp
-                    break
-                    
-            return file_path, title, duration, uploader, thumb_path
+            return build_result(video_info)
 
     return await asyncio.to_thread(download)
 
@@ -2560,11 +2923,23 @@ async def build_account_inspection_report(client, target):
     )
 
 
-async def get_account_chat_lists(client, mode="all"):
-    """يعرض القنوات والسوبرقروبات والقروبات العادية، ولا يعتمد على megagroup فقط."""
+# ذاكرة مؤقتة للقنوات والقروبات لتسريع العرض الفوري وعدم تكرار استعلامات تيليجرام البطيئة
+_account_chat_lists_cache = {}
+
+async def get_account_chat_lists(client, mode="all", force_refresh=False):
+    """يعرض القنوات والسوبرقروبات والقروبات العادية بتهيئة سريعة وذاكرة مؤقتة ذكية."""
+    client_id = id(client)
+    cache_key = (client_id, mode)
+    now = time.monotonic()
+    
+    if not force_refresh and cache_key in _account_chat_lists_cache:
+        cached_time, cached_groups, cached_channels = _account_chat_lists_cache[cache_key]
+        if now - cached_time < 300: # تخزين مؤقت لمدة 5 دقائق
+            return cached_groups, cached_channels
+
     groups = []
     channels = []
-    async for dialog in client.iter_dialogs(limit=None):
+    async for dialog in client.iter_dialogs(limit=300): # تحديد حد معقول لضمان السرعة الفورية
         entity = dialog.entity
         is_broadcast_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
         is_group = bool(
@@ -2577,13 +2952,13 @@ async def get_account_chat_lists(client, mode="all"):
 
         is_owner = bool(getattr(entity, "creator", False))
         is_admin = is_owner or bool(getattr(getattr(entity, "admin_rights", None), "post_messages", False))
-        try:
-            permissions = await client.get_permissions(entity, "me")
-            is_owner = is_owner or bool(getattr(permissions, "is_creator", False))
-            is_admin = is_admin or bool(getattr(permissions, "is_admin", False))
-        except Exception:
-            # قائمة الكل يجب أن تظهر حتى لو كانت صلاحيات بعض الحوارات غير متاحة مؤقتاً.
-            pass
+        if mode != "all":
+            try:
+                permissions = await client.get_permissions(entity, "me")
+                is_owner = is_owner or bool(getattr(permissions, "is_creator", False))
+                is_admin = is_admin or bool(getattr(permissions, "is_admin", False))
+            except Exception:
+                pass
 
         if mode == "owner" and not is_owner:
             continue
@@ -2595,8 +2970,11 @@ async def get_account_chat_lists(client, mode="all"):
             channels.append(item)
         else:
             groups.append(item)
+
     groups.sort(key=lambda item: str(item[0]).casefold())
     channels.sort(key=lambda item: str(item[0]).casefold())
+    
+    _account_chat_lists_cache[cache_key] = (now, groups, channels)
     return groups, channels
 
 
@@ -2794,7 +3172,10 @@ YOUTUBE_GUIDE = """⤾ اوامــر اليـوتيـوب 🎧
 
 • .تحميل
 ↞ بـ وضع رابط فيديو مـع الامر
-↞ لـ تحميل فيديو من اليوتيوب بالرابط 🎗"""
+↞ لـ تحميل فيديو من اليوتيوب بالرابط 🎗
+
+• .ريديت [ رابط ريديت ]
+↞ لـ تحميل فيديو أو صورة من ريديت 🎗"""
 
 TIKTOK_GUIDE = """⤾ اوامــر تحميل تيك توك 🔘
 ‏⋆ —— ‹ ᥙ𝗌𝖾𝗋𝖻᥆𝗍 › —— ⋆
@@ -2935,6 +3316,7 @@ async def download_and_send_url(client, chat_id, url, audio_only=False):
         await client.send_file(chat_id, file_path, caption=caption, voice_note=False)
     finally:
         _safe_remove(file_path)
+
 
 
 async def download_github_repository(client, chat_id, url):
@@ -3241,7 +3623,13 @@ async def register_userbot_events(client_inst, owner_id):
                 temporary_seconds = kwargs.pop("temporary_seconds", None)
                 if command_reply_to and "reply_to" not in kwargs:
                     kwargs["reply_to"] = command_reply_to
-                sent_message = await client_inst.send_message(chat_id, message, **kwargs)
+                outgoing_message = message
+                if isinstance(message, str) and "formatting_entities" not in kwargs and not kwargs.get("buttons"):
+                    outgoing_message, premium_entities = prepare_premium_command_message(message)
+                    if premium_entities:
+                        kwargs["formatting_entities"] = premium_entities
+                        kwargs["parse_mode"] = None
+                sent_message = await client_inst.send_message(chat_id, outgoing_message, **kwargs)
                 # لا تحذف القوائم والأزرار أو رسائل التقدم، ولا نتائج الترجمة والتحويل النهائية.
                 message_text = str(message or "")
                 is_progress = message_text.startswith(("⏳", "🔍", "⚡", "📊"))
@@ -3345,6 +3733,111 @@ async def register_userbot_events(client_inst, owner_id):
 
             # ===== الأوامر القديمة: تعمل بالنقطة أو بدونها =====
             # التسطير والفرديات والريبلاي والكتم من مميزات الحساب القديمة، وليست مميزات سورس.
+
+            # ===== ميزات الذكاء الاصطناعي والأصوات الواقعية =====
+            if text in (".تفعيل الذكاء الاصطناعي", "تفعيل الذكاء الاصطناعي"):
+                if not is_source_subscribed(owner_id):
+                    msg = await command_reply(source_lock_message())
+                    asyncio.create_task(delete_message_after(msg, 6))
+                    return
+                user_info["ai_chat_enabled"] = True
+                save_data()
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                msg = await command_reply("🤖 **تم تفعيل الذكاء الاصطناعي بنجاح.**\n\nاستخدم الآن: `.ذكاء [سؤالك]`")
+                asyncio.create_task(delete_message_after(msg, 6))
+                return
+
+            if text in (".تعطيل الذكاء الاصطناعي", "تعطيل الذكاء الاصطناعي"):
+                user_info["ai_chat_enabled"] = False
+                save_data()
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                msg = await command_reply("🛑 **تم تعطيل الذكاء الاصطناعي.**")
+                asyncio.create_task(delete_message_after(msg, 6))
+                return
+
+            if text.startswith(".ذكاء ") or text.startswith("ذكاء "):
+                if not is_source_subscribed(owner_id):
+                    msg = await command_reply(source_lock_message())
+                    asyncio.create_task(delete_message_after(msg, 6))
+                    return
+                if not user_info.get("ai_chat_enabled", False):
+                    msg = await command_reply("⚠️ الذكاء الاصطناعي معطل. اكتب أولاً: `.تفعيل الذكاء الاصطناعي`")
+                    asyncio.create_task(delete_message_after(msg, 6))
+                    return
+                prompt = text.split(" ", 1)[1].strip()
+                if not prompt:
+                    msg = await command_reply("⚠️ اكتب سؤالك أو طلبك بعد الأمر.")
+                    asyncio.create_task(delete_message_after(msg, 6))
+                    return
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                wait_msg = await client_inst.send_message(chat_id, "🤖 جاري التفكير...")
+                result = await ask_sarcastic_ai(prompt, owner_id)
+                try:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
+                if result.get("type") == "image" and result.get("url"):
+                    await client_inst.send_file(chat_id, result["url"], caption=result.get("text", ""), reply_to=event.reply_to_msg_id)
+                else:
+                    await client_inst.send_message(chat_id, result.get("text", "⚠️ تعذر الحصول على رد الآن."), reply_to=event.reply_to_msg_id)
+                return
+
+            # ===== أصوات البنات الواقعية المتاحة =====
+            voice_match = re.match(r"^\.?بنت\s*([1-7])\s*(.*)", text)
+            if voice_match:
+                v_num, v_text = voice_match.groups()
+                voice_key = f"بنت {v_num}"
+                final_text = v_text.strip()
+                if not final_text and event.reply_to_msg_id:
+                    rep_msg = await event.get_reply_message()
+                    if rep_msg and rep_msg.text:
+                        final_text = rep_msg.text
+                if not final_text:
+                    msg = await command_reply(f"⚠️ اكتب نصاً بعد أمر {voice_key} أو رد على رسالة.")
+                    asyncio.create_task(delete_message_after(msg, 6))
+                    return
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                wait_msg = await client_inst.send_message(chat_id, f"🎙️ جاري توليد فويس ({voice_key})...")
+                audio_path = await generate_ai_voice_audio_v2(final_text, voice_key)
+                try:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
+                if audio_path:
+                    from telethon.tl.types import DocumentAttributeAudio
+                    duration = 5
+                    try:
+                        from pydub import AudioSegment
+                        duration = max(1, int(len(AudioSegment.from_file(audio_path)) / 1000))
+                    except Exception:
+                        pass
+                    await client_inst.send_file(
+                        chat_id,
+                        audio_path,
+                        voice_note=True,
+                        force_document=False,
+                        mime_type="audio/ogg",
+                        attributes=[DocumentAttributeAudio(duration=duration, voice=True)],
+                        reply_to=event.reply_to_msg_id,
+                    )
+                    _safe_remove(audio_path)
+                else:
+                    msg = await command_reply("❌ فشل توليد الفويس. تحقق من رصيد ElevenLabs أو الاتصال.")
+                    asyncio.create_task(delete_message_after(msg, 6))
+                return
+
             legacy_text = text[1:].strip() if text.startswith(".") else text.strip()
             legacy_parts = legacy_text.split()
             legacy_first_word = legacy_parts[0] if legacy_parts else ""
@@ -3968,18 +4461,20 @@ async def register_userbot_events(client_inst, owner_id):
                 query = text[4:].strip()
                 if not query:
                     return
-                await event.delete()
-                status = await command_reply( "⏳ جاري البحث وتحميل الصوت...")
                 try:
-                    search_url = f"ytsearch1:{query}"
-                    media_path, info = await _ytdlp_download(search_url, audio_only=True)
-                    try:
-                        await command_reply_file( media_path, caption=(info.get("title") or query)[:900])
-                    finally:
-                        _safe_remove(media_path)
+                    await event.delete()
+                except Exception:
+                    pass
+                status = await command_reply("⏳ جاري فهم طلبك والبحث وتحميل الصوت...")
+                media_path = None
+                try:
+                    media_path, info, _plan = await hybrid_ytdlp_download(query, default_audio=True)
+                    await command_reply_file(media_path, caption=(info.get("title") or query)[:900])
                     await status.delete()
                 except Exception as e:
                     await status.edit(f"❌ تعذر تحميل الصوت:\n`{e}`")
+                finally:
+                    _safe_remove(media_path)
                 return
 
             if text.startswith("تحميل "):
@@ -3996,6 +4491,22 @@ async def register_userbot_events(client_inst, owner_id):
                 except Exception as e:
                     await report_admin_error("تحميل رابط", e, owner_id, chat_id)
                     await status.edit(f"❌ تعذر التحميل:\n`{e}`")
+                return
+
+            if text.startswith("ريديت "):
+                if not is_source_subscribed(owner_id):
+                    return
+                url = text[6:].strip()
+                if not url:
+                    return
+                await event.delete()
+                status = await command_reply("⏳ جاري تحميل محتوى ريديت...")
+                try:
+                    await download_and_send_url(client_inst, chat_id, url, audio_only=False)
+                    await status.delete()
+                except Exception as e:
+                    await report_admin_error("تحميل ريديت", e, owner_id, chat_id)
+                    await status.edit(f"❌ تعذر تحميل ريديت:\n`{e}`")
                 return
 
             if text.startswith("بنترست "):
@@ -4178,20 +4689,30 @@ async def register_userbot_events(client_inst, owner_id):
                         await event.delete()
                     except Exception:
                         pass
-                    
-                    search_msg = await command_reply( f"🔍 جاري البحث في يوتيوب عن: `{query}`...")
+                    search_msg = await command_reply(f"🔍 جاري فهم طلبك والبحث في يوتيوب عن: `{query}`...")
                     try:
-                        file_path, title, duration, uploader, thumb_path = await search_and_download_youtube(query)
+                        plan = await resolve_hybrid_download_request(query, default_audio=True)
+                        file_path, title, duration, uploader, thumb_path = await search_and_download_youtube(plan["search_query"])
                         if file_path and os.path.exists(file_path):
                             await search_msg.delete()
+                            from telethon.tl.types import DocumentAttributeAudio
+                            safe_title = (title or "مقطع بدون عنوان").strip()[:64]
+                            safe_channel = (uploader or "قناة يوتيوب").strip()[:64]
+                            display_caption = (
+                                f"🎧 **{safe_title}**\n"
+                                f"📺 القناة: **{safe_channel}**\n"
+                                f"⏱️ المدة: `{format_media_duration(duration)}`"
+                            )
                             await client_inst.send_file(
                                 chat_id,
                                 file_path,
                                 thumb=thumb_path,
-                                duration=duration,
-                                title=title,
-                                performer=uploader,
-                                voice_note=False
+                                caption=display_caption,
+                                parse_mode="md",
+                                mime_type="audio/mpeg",
+                                force_document=False,
+                                attributes=[DocumentAttributeAudio(duration=int(duration or 0), title=safe_title, performer=safe_channel)],
+                                voice_note=False,
                             )
                         else:
                             await search_msg.edit("❌ لم يتم العثور على نتائج مطابقة لبحثك.")
@@ -4669,7 +5190,6 @@ def main_menu_keyboard(user_id):
         if source_active:
             buttons.append([Button.inline("⭐ مميزات السورس", b"source_features_menu")])
         buttons.append([Button.inline("📊 حالة الاشتراكات", b"sub_info")])
-
     if is_staff(user_id):
         buttons.append([Button.inline("👑 لوحة تحكم المسؤول", b"admin_menu")])
     buttons.extend(developer_main_buttons())
@@ -4745,9 +5265,9 @@ def flush_speed_menu_keyboard(user_id):
     ]
 
 def source_features_menu_keyboard():
-    # مميزات المستخدم القديمة تبقى أولاً، والتفليش أصبح قسماً مستقلاً.
     return [
         [Button.inline("💥 قسم التفليش", b"flush_section"), Button.inline("📦 مجموعة التخزين", b"storage_group_menu")],
+        [Button.inline("🤖 قسم الذكاء الاصطناعي", b"ai_main_menu")],
         [Button.inline("📌 فكرة التثبيت", b"feature_pin_info")],
         [Button.inline("🧹 مسح الشامل", b"info_purge_all"), Button.inline("🔢 مسح بالعدد المحدد", b"info_purge_quick")],
         [Button.inline("🔇 الكتم الشامل", b"mute_menu"), Button.inline("🎙️ الصوتيات", b"voice_menu")],
@@ -4756,12 +5276,6 @@ def source_features_menu_keyboard():
         [Button.inline("🎧 البحث والتحميل", b"section_download"), Button.inline("🧰 الأدوات", b"section_tools")],
         [Button.inline("🔙 رجوع", b"main_menu")]
     ]
-
-
-def section_back_keyboard():
-    return [[Button.inline("◀️ رجوع", b"source_features_menu")]]
-
-
 def tools_back_keyboard():
     return [[Button.inline("◀️ رجوع", b"section_tools")]]
 
@@ -4787,13 +5301,17 @@ def self_save_section_keyboard():
     ]
 
 
-def chat_lists_keyboard():
-    return [
+def chat_lists_keyboard(user_id=None):
+    rows = [
         [Button.inline("💬 قروباتي", b"chat_list_groups_all"), Button.inline("📢 قنواتي", b"chat_list_channels_all")],
         [Button.inline("👑 قروباتي مالك", b"chat_list_groups_owner"), Button.inline("👑 قنواتي مالك", b"chat_list_channels_owner")],
         [Button.inline("🛡️ قروباتي أدمن", b"chat_list_groups_admin"), Button.inline("🛡️ قنواتي أدمن", b"chat_list_channels_admin")],
-        [Button.inline("◀️ رجوع", b"section_account")],
     ]
+    if user_id is not None and (is_owner(user_id) or is_responsible(user_id)):
+        rows.append([Button.inline("🔄 تحديث شامل", b"chat_list_refresh"), Button.inline("◀️ رجوع", b"section_account")])
+    else:
+        rows.append([Button.inline("◀️ رجوع", b"section_account")])
+    return rows
 
 
 def publish_section_keyboard():
@@ -5140,14 +5658,85 @@ async def start_handler(event):
                     await report_admin_error("كود تفعيل غير صالح", "محاولة كود غير صالح أو مستخدم", user_id)
                     await event.respond("❌ رمز التفعيل غير صالح أو تم استخدامه سابقاً.")
 
-    me = await bot.get_me()
-    bot_username = me.username or "bot"
+    welcome_txt, welcome_entities = build_damon_welcome_message()
+    try:
+        await event.respond(
+            welcome_txt,
+            buttons=main_menu_keyboard(user_id),
+            link_preview=False,
+            parse_mode=None,
+            formatting_entities=welcome_entities,
+        )
+    except Exception as welcome_error:
+        # لا تسمح لزينة الواجهة أن تمنع /start: النص العادي والأزرار يظهران دائماً.
+        print(f"[WELCOME EMOJI FALLBACK] {welcome_error}")
+        await event.respond(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
 
-    welcome_txt = (
-        f"مرحباً بك في بوت [ديمون](https://t.me/{bot_username})\n\n"
-        "أزرار التحكم بالأسفل 👇:"
+
+# ==================== AI Section: smooth in-place navigation ====================
+async def _edit_ai_view(event, text, buttons):
+    """يحدّث نفس رسالة القائمة فقط؛ لا يحذفها ولا ينشئ رسالة قائمة جديدة."""
+    try:
+        await event.edit(text, buttons=buttons, link_preview=False)
+    except MessageNotModifiedError:
+        pass
+    except Exception as exc:
+        print(f"[AI MENU EDIT ERROR] {exc}")
+        try:
+            await event.answer("⚠️ تعذر تحديث القائمة، جرّب فتح مميزات السورس مرة أخرى.", alert=True)
+        except Exception:
+            pass
+
+
+async def send_ai_main_menu(event):
+    txt = (
+        "🤖 **قسم الذكاء الاصطناعي**\n"
+        "⋆ ———————————————————— ⋆\n\n"
+        "اختر القسم الذي تريد استخدامه أو الاطلاع على شرحه من الأزرار التالية."
     )
-    await event.respond(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
+    buttons = [
+        [Button.inline("🎙️ الأصوات 1 — البنات", b"ai_voices_help")],
+        [Button.inline("🧠 الذكاء الاصطناعي", b"ai_chat_help")],
+        [Button.inline("🔙 رجوع إلى مميزات السورس", b"source_features_menu")],
+    ]
+    await _edit_ai_view(event, txt, buttons)
+
+
+async def send_ai_chat_help(event):
+    txt = (
+        "🧠 **شرح الذكاء الاصطناعي والبحث**\n"
+        "⋆ ———————————————————— ⋆\n\n"
+        "• `.تفعيل الذكاء الاصطناعي`\n"
+        "↞ لتشغيل الدردشة والبحث الذكي على حسابك.\n\n"
+        "• `.تعطيل الذكاء الاصطناعي`\n"
+        "↞ لإيقاف الدردشة والبحث الذكي.\n\n"
+        "• `.ذكاء [سؤالك أو طلبك]`\n"
+        "↞ للدردشة وطرح الأسئلة والبحث الذكي.\n\n"
+        "**مثال:** `.ذكاء ما هي أفضل طريقة لتنظيم الوقت؟`\n\n"
+        "📌 يجب تفعيل الذكاء أولاً قبل استخدام أمر `.ذكاء`."
+    )
+    await _edit_ai_view(event, txt, [[Button.inline("🔙 رجوع لقسم الذكاء", b"ai_main_menu")]])
+
+
+async def send_12_voices_guide_smooth(event):
+    """عرض أصوات البنات المتاحة فقط عبر تعديل الرسالة نفسها."""
+    txt = (
+        "🎙️ **الأصوات 1 — أصوات البنات الواقعية**\n"
+        "⋆ ———————————————————— ⋆\n\n"
+        "• `.بنت 1 [النص]` ↞ ناعم ودلوع.\n"
+        "• `.بنت 2 [النص]` ↞ حنون وهادئ.\n"
+        "• `.بنت 3 [النص]` ↞ خفيف ومرح.\n"
+        "• `.بنت 4 [النص]` ↞ لطيف وواضح.\n"
+        "• `.بنت 5 [النص]` ↞ دافئ ومريح.\n"
+        "• `.بنت 6 [النص]` ↞ ناعم وثقيل.\n"
+        "• `.بنت 7 [النص]` ↞ هادئ وفخم.\n\n"
+        "💡 **طريقة الاستخدام:**\n"
+        "• اكتب الأمر بالنقطة مع النص، مثال: `.بنت 1 هلا والله`.\n"
+        "• أو ردّ على رسالة ثم اكتب الأمر لتحويل نصها إلى فويس.\n\n"
+        "📌 هذه هي جميع أصوات البنات المتاحة فعلياً للحساب الحالي عبر API."
+    )
+    await _edit_ai_view(event, txt, [[Button.inline("🔙 رجوع لقسم الذكاء", b"ai_main_menu")]])
+
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
@@ -5156,15 +5745,31 @@ async def callback_handler(event):
     data = event.data
     init_user_db(user_id)
     track_menu_navigation(user_id, data)
+
     if data in OWNER_ONLY_CALLBACKS and not is_owner(user_id):
         await event.answer("⚠️ تعذر الوصول: هذه الإدارة مخصصة للريس فقط.", alert=True)
+        return
+
+    # هذه المعالجات أولاً حتى لا تتعارض معها أي فروع قديمة.
+    # توافق مع أي رسائل قائمة قديمة تحمل المعرف السابق.
+    if data in (b"ai_main_menu", b"ai_section_menu"):
+        await event.answer()
+        await send_ai_main_menu(event)
+        return
+    if data == b"ai_chat_help":
+        await event.answer()
+        await send_ai_chat_help(event)
+        return
+    if data == b"ai_voices_help":
+        await event.answer()
+        await send_12_voices_guide_smooth(event)
         return
 
     fast_menu_callbacks = {
         b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"nick_am_menu", b"speed_menu",
         b"source_features_menu", b"flush_section", b"flush_menu", b"mute_menu", b"voice_menu", b"clone_menu", b"welcome_menu",
-        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"section_account", b"section_publish", b"section_download", b"section_tools",
-        b"youtube_menu", b"tiktok_menu", b"instagram_menu", b"pinterest_menu", b"story_menu", b"github_menu", b"writing_menu",
+        b"auto_publish_menu", b"conversion_menu", b"id_menu", b"ai_main_menu", b"ai_chat_help", b"ai_voices_help", b"section_account", b"section_publish", b"section_download", b"section_tools",
+        b"youtube_menu", b"tiktok_menu", b"instagram_menu", b"pinterest_menu", b"story_menu", b"github_menu", b"writing_menu", b"ai_section_menu",
     }
     if data in fast_menu_callbacks:
         try:
@@ -5172,7 +5777,7 @@ async def callback_handler(event):
         except Exception:
             pass
 
-    if data in [b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"flush_section", b"flush_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu", b"clone_menu", b"welcome_menu", b"auto_publish_menu", b"conversion_menu", b"id_menu"]:
+    if data in [b"main_menu", b"tastir_section", b"tastir_menu", b"fardiyyat_menu", b"reply_menu", b"flush_section", b"flush_menu", b"mute_menu", b"source_features_menu", b"voice_menu", b"admin_menu", b"admin_users_menu", b"admin_admins_menu", b"admin_words_menu", b"admin_codes_menu", b"admin_data_menu", b"admin_tastir_menu", b"admin_fardiyyat_menu", b"clone_menu", b"welcome_menu", b"auto_publish_menu", b"conversion_menu", b"id_menu", b"ai_main_menu", b"ai_chat_help", b"ai_voices_help"]:
         user_states.pop(user_id, None)
 
     if data.startswith(b"calc_"):
@@ -5197,14 +5802,19 @@ async def callback_handler(event):
             navigation_history.pop(int(user_id), None)
 
     if data == b"main_menu":
-        me = await bot.get_me()
-        bot_username = me.username or "bot"
-        welcome_txt = (
-            f"مرحباً بك في بوت [ديمون](https://t.me/{bot_username})\n\n"
-            "أزرار التحكم بالأسفل 👇:"
-        )
+        welcome_txt, welcome_entities = build_damon_welcome_message()
         try:
-            await event.edit(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
+            try:
+                await event.edit(
+                    welcome_txt,
+                    buttons=main_menu_keyboard(user_id),
+                    link_preview=False,
+                    parse_mode=None,
+                    formatting_entities=welcome_entities,
+                )
+            except Exception as welcome_error:
+                print(f"[WELCOME MENU EMOJI FALLBACK] {welcome_error}")
+                await event.edit(welcome_txt, buttons=main_menu_keyboard(user_id), link_preview=False)
         except MessageNotModifiedError:
             await event.answer()
 
@@ -5707,7 +6317,24 @@ async def callback_handler(event):
         if not is_source_subscribed(user_id):
             await event.answer(source_lock_message(), alert=True)
             return
-        await event.edit("💬 **قروباتي وقنواتي**\n\nاختر القائمة التي تريد عرضها.", buttons=chat_lists_keyboard())
+        await event.edit("💬 **قروباتي وقنواتي**\n\nاختر القائمة التي تريد عرضها.", buttons=chat_lists_keyboard(user_id))
+
+    elif data == b"chat_list_refresh":
+        if not is_source_subscribed(user_id) or not (is_owner(user_id) or is_responsible(user_id)):
+            await event.answer("⚠️ هذا الزر مخصص للمسؤولين والريس فقط.", alert=True)
+            return
+        # تحديث شامل وتنشيط لكل الذاكرة المؤقتة والبيانات دون حذف أي معلومة
+        client = user_clients.get(user_id)
+        if client:
+            client_id = id(client)
+            for m in ["all", "owner", "admin"]:
+                _account_chat_lists_cache.pop((client_id, m), None)
+        try:
+            save_data()
+        except Exception:
+            pass
+        await event.answer("✅ تم التحديث الشامل وتنشيط كافة البيانات بنجاح دون حذف أي معلومة.", alert=True)
+        await event.edit("💬 **قروباتي وقنواتي**\n\nتم التحديث الشامل بنجاح. اختر القائمة التي تريد عرضها:", buttons=chat_lists_keyboard(user_id))
 
     elif data.startswith(b"chat_list_"):
         if not is_source_subscribed(user_id):
@@ -5719,7 +6346,9 @@ async def callback_handler(event):
             return
         try:
             _, _, category, mode = data.decode().split("_", 3)
-            groups, channels = await get_account_chat_lists(client, mode)
+            # إرسال رسالة انتظار سريعة جداً عند الجلب الأول لتفادي تعليق واجهة تيليجرام
+            await event.edit("⚡ جاري جلب القائمة فوراً...")
+            groups, channels = await get_account_chat_lists(client, mode, force_refresh=False)
             is_groups = category == "groups"
             title = "قروباتي" if is_groups else "قنواتي"
             mode_label = {"all": "الكل", "owner": "مالك", "admin": "أدمن"}.get(mode, "الكل")
@@ -6862,7 +7491,8 @@ async def callback_handler(event):
         buttons = []
         rows = []
         for index, item in enumerate(DEVELOPERS[:3], 1):
-            title = "👑 الريس" if index == 1 else f"👨‍💻 المطور {index}"
+            label = developer_display_name(item)
+            title = "Nardouv" if index == 1 else label
             rows.append(f"• {title}: @{item.get('username', 'غير محدد')}")
             buttons.append([Button.inline(f"✏️ تغيير {title}", f"edit_developer_{index - 1}".encode())])
             if index > 1:
@@ -7115,8 +7745,9 @@ async def message_input_handler(event):
             if len(DEVELOPERS) >= 3:
                 await event.respond("⚠️ وصلت إلى الحد الأقصى: ثلاثة مطورين.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
                 return
-            DEVELOPERS.append({"username": developer_username})
-            success_text = "✅ تم إضافة المطور إلى القائمة الرئيسية."
+            developer_name = await resolve_developer_display_name(developer_username)
+            DEVELOPERS.append({"username": developer_username, "display_name": developer_name})
+            success_text = f"✅ تم إضافة {developer_name} إلى القائمة الرئيسية."
         else:
             try:
                 developer_index = int(developer_index)
@@ -7125,10 +7756,13 @@ async def message_input_handler(event):
             if developer_index < 0 or developer_index >= len(DEVELOPERS):
                 await event.respond("⚠️ المطور المحدد لم يعد موجوداً.", buttons=[[Button.inline("🔙 رجوع", b"manage_developers_menu")]])
                 return
-            DEVELOPERS[developer_index] = {"username": developer_username}
+            developer_name = await resolve_developer_display_name(developer_username)
+            DEVELOPERS[developer_index] = {"username": developer_username, "display_name": developer_name}
             if developer_index == 0:
                 DEV_URL = f"https://t.me/{developer_username}"
-            success_text = "✅ تم تغيير المطور في القائمة الرئيسية."
+                developer_name = "Nardouv"
+                DEVELOPERS[developer_index]["display_name"] = developer_name
+            success_text = f"✅ تم تغيير {developer_name} في القائمة الرئيسية."
         save_data(force=True)
         user_states.pop(user_id, None)
         await event.respond(success_text, buttons=main_menu_keyboard(user_id))
@@ -7760,21 +8394,179 @@ async def message_input_handler(event):
             await event.respond("⚠️ يرجى إرسال آيدي رقمي صحيح:", buttons=[[Button.inline("🔙 رجوع", b"mute_menu")]])
 
 # ==================== Main Bot Startup ====================
+
+async def ask_sarcastic_ai(prompt, owner_id):
+    """بحث ودردشة عبر Gemini مع Google Search؛ يعمل خارج حلقة الأحداث حتى لا يجمّد البوت."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return {"type": "text", "text": "⚠️ لم يتم ضبط مفتاح Gemini للذكاء الاصطناعي."}
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+    payload = {
+        "contents": [{
+            "parts": [{
+                "text": (
+                    "أنت مساعد عربي ذكي في بوت تيليجرام. أجب بدقة وبأسلوب لطيف ومختصر، "
+                    "واستخدم بحث Google المدمج عند الحاجة للمعلومات الحديثة. "
+                    f"سؤال المستخدم: {prompt}"
+                )
+            }]
+        }],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": 0.75, "maxOutputTokens": 1024},
+    }
+
+    def _request():
+        return requests.post(
+            url,
+            params={"key": api_key},
+            json=payload,
+            timeout=22,
+        )
+
+    try:
+        response = await asyncio.to_thread(_request)
+    except requests.RequestException as exc:
+        print(f"[GEMINI NETWORK ERROR] {exc}")
+        return {"type": "text", "text": "⚠️ تعذر الاتصال بخدمة الذكاء حالياً. حاول مرة أخرى بعد قليل."}
+
+    if response.status_code == 200:
+        try:
+            candidates = response.json().get("candidates", [])
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+            answer = "".join(str(part.get("text", "")) for part in parts).strip()
+            if answer:
+                return {"type": "text", "text": answer}
+        except Exception as exc:
+            print(f"[GEMINI PARSE ERROR] {exc}")
+        return {"type": "text", "text": "⚠️ لم يصل رد قابل للقراءة من خدمة الذكاء. حاول صياغة السؤال بشكل مختلف."}
+
+    try:
+        api_error = response.json().get("error", {})
+        detail = api_error.get("message", "")
+    except Exception:
+        detail = ""
+    print(f"[GEMINI API ERROR] HTTP {response.status_code}: {detail}")
+
+    if response.status_code == 429:
+        return {"type": "text", "text": "⚠️ خدمة Gemini وصلت حدّ الاستخدام حالياً. انتظر قليلاً أو راجع حصة الاستخدام والفوترة للمفتاح، ثم أعد المحاولة."}
+    if response.status_code in (401, 403):
+        return {"type": "text", "text": "⚠️ مفتاح Gemini غير مخول لهذه العملية أو يحتاج تفعيل الصلاحيات."}
+    return {"type": "text", "text": "⚠️ تعذر تنفيذ طلب الذكاء الآن. حاول لاحقاً."}
+async def send_ai_section_menu(client_inst, owner_id, chat_id):
+    """واجهة متوافقة للرسائل القديمة: ترشد إلى أصوات البنات فقط."""
+    txt = (
+        "🤖 **قسم الذكاء الاصطناعي**\n\n"
+        "🎙️ **الأصوات 1 — البنات الواقعية:**\n"
+        "استخدم `.بنت 1` إلى `.بنت 7` مع النص أو بالرد على رسالة.\n\n"
+        "🧠 استخدم `.تفعيل الذكاء الاصطناعي` ثم `.ذكاء [سؤالك]`."
+    )
+    await client_inst.send_message(
+        chat_id,
+        txt,
+        buttons=[[Button.inline("🔙 رجوع لقسم الذكاء", b"ai_main_menu")]],
+        link_preview=False,
+    )
+
+async def send_ai_guide_menu(client_inst, owner_id, chat_id):
+    """دليل متوافق مع الواجهة الحالية: ذكاء وأصوات البنات فقط."""
+    txt = (
+        "⤾ اوامـر الـذكـاء الاصطـناعي والاصـوات 🤖🎙️\n"
+        "⋆ ———————————————————— ⋆\n\n"
+        "• `.تفعيل الذكاء الاصطناعي`\n↞ لتفعيل الدردشة والبحث الذكي.\n\n"
+        "• `.ذكاء [سؤالك]`\n↞ للدردشة والبحث الذكي.\n\n"
+        "• `.بنت 1 [النص]` إلى `.بنت 7 [النص]`\n↞ لتحويل النص أو الرسالة المردود عليها إلى فويس أنثوي واقعي."
+    )
+    await client_inst.send_message(chat_id, txt, buttons=[[Button.inline("🔙 رجوع", data=b"ai_main_menu")]])
+
+# ==================== Girl Voices — Arabic Natural Delivery ====================
+# أصوات نسائية متاحة للحساب الحالي؛ تستخدم النموذج متعدد اللغات الأنسب للنطق العربي الطبيعي.
+AI_GIRL_VOICE_PROFILES = {
+    "بنت 1": {"voice_id": "cgSgspJ2msm6clMCkdW9", "label": "خفيف ودلوع", "stability": 0.34, "similarity": 0.90, "style": 0.22},
+    "بنت 2": {"voice_id": "EXAVITQu4vr4xnSDxMaL", "label": "دافئ وحنون", "stability": 0.44, "similarity": 0.88, "style": 0.18},
+    "بنت 3": {"voice_id": "FGY2WhTYpPnrIDTdsKH5", "label": "مرح ولطيف", "stability": 0.38, "similarity": 0.84, "style": 0.26},
+    "بنت 4": {"voice_id": "Xb7hH8MSUJpSbSDYk0k2", "label": "واضح وهادئ", "stability": 0.55, "similarity": 0.86, "style": 0.12},
+    "بنت 5": {"voice_id": "XrExE9yKIg1WjnnlVkGX", "label": "أنثوي مريح", "stability": 0.42, "similarity": 0.87, "style": 0.22},
+    "بنت 6": {"voice_id": "hpp4J3VqNfWAUOO0d1Us", "label": "ناعم وثقيل", "stability": 0.40, "similarity": 0.90, "style": 0.20},
+    "بنت 7": {"voice_id": "pFZP5JQG7iQjIQuC4Bku", "label": "فخم وهادئ", "stability": 0.52, "similarity": 0.85, "style": 0.14},
+}
+AI_VOICES_CONFIG_12 = {name: profile["voice_id"] for name, profile in AI_GIRL_VOICE_PROFILES.items()}
+
+
+async def generate_ai_voice_audio_v2(text, voice_name):
+    """ينشئ OGG/Opus مباشراً بصوت أنثوي طبيعي عربي لرسائل Voice Note."""
+    try:
+        eleven_key = "sk_e62a48b7b0d68a8ad065c5935397dad3ea443634df64f4df"
+        profile = AI_GIRL_VOICE_PROFILES.get(voice_name, AI_GIRL_VOICE_PROFILES["بنت 1"])
+        raw_text = " ".join(str(text or "").split()).strip()
+        if not raw_text:
+            return None
+
+        # نترك النص كما كتبه المستخدم؛ إزالة وسوم الأداء الإنجليزية تمنع إفساد النطق العربي.
+        response = await asyncio.to_thread(
+            requests.post,
+            f"https://api.elevenlabs.io/v1/text-to-speech/{profile['voice_id']}",
+            params={"output_format": "opus_48000_32"},
+            json={
+                "text": raw_text,
+                "model_id": "eleven_multilingual_v2",
+                "voice_settings": {
+                    "stability": profile["stability"],
+                    "similarity_boost": profile["similarity"],
+                    "style": profile["style"],
+                    "use_speaker_boost": True,
+                },
+            },
+            headers={
+                "Accept": "audio/ogg",
+                "Content-Type": "application/json",
+                "xi-api-key": eleven_key,
+            },
+            timeout=35,
+        )
+        if response.status_code != 200:
+            print(f"[ELEVENLABS API ERROR] HTTP {response.status_code}: {response.text[:500]}")
+            return None
+        if not response.content.startswith(b"OggS"):
+            print("[ELEVENLABS AUDIO ERROR] الرد ليس ملف OGG/Opus صالحاً.")
+            return None
+        output = os.path.join(TEMP_DIR, f"girl_voice_{int(time.time() * 1000)}_{random.randint(100, 999)}.ogg")
+        with open(output, "wb") as audio_file:
+            audio_file.write(response.content)
+        return output
+    except Exception as exc:
+        print(f"[ELEVENLABS TTS EXCEPTION] {exc}")
+        return None
+
+async def send_12_voices_guide(client_inst, owner_id, chat_id, message_id=None):
+    """توافق مع أي زر قديم: يعرض دليل أصوات البنات فقط."""
+    txt = (
+        "🎙️ **الأصوات 1 — أصوات البنات الواقعية**\n\n"
+        "• `.بنت 1 [النص]` ↞ ناعم ودلوع.\n"
+        "• `.بنت 2 [النص]` ↞ حنون وهادئ.\n"
+        "• `.بنت 3 [النص]` ↞ خفيف ومرح.\n"
+        "• `.بنت 4 [النص]` ↞ لطيف وواضح.\n"
+        "• `.بنت 5 [النص]` ↞ دافئ ومريح.\n"
+        "• `.بنت 6 [النص]` ↞ ناعم وثقيل.\n"
+        "• `.بنت 7 [النص]` ↞ هادئ وفخم."
+    )
+    buttons = [[Button.inline("🔙 رجوع لقسم الذكاء", data=b"ai_main_menu")]]
+    try:
+        if message_id:
+            await client_inst.edit_message(chat_id, message_id, txt, buttons=buttons, link_preview=False)
+        else:
+            await client_inst.send_message(chat_id, txt, buttons=buttons, link_preview=False)
+    except Exception:
+        await client_inst.send_message(chat_id, txt, buttons=buttons, link_preview=False)
+
 async def main():
     print("Starting bot...")
     await bot.start(bot_token=BOT_TOKEN)
     manager_me = await bot.get_me()
-    if not manager_me.bot:
-        raise RuntimeError("جلسة الإدارة ليست بوتاً. احذف جلسة manager_bot_inline_session وأعد التشغيل.")
     print(f"Manager Bot: @{manager_me.username or 'بدون_يوزر'} | ID: {manager_me.id}")
     print("لتعمل .الاوامر كأزرار عبر البوت: فعّل Inline Mode لهذا البوت من BotFather عبر /setinline.")
-    
     asyncio.create_task(subscription_maintenance_loop())
-
-    # نأخذ لقطة ثابتة قبل الاسترجاع، لأن تهيئة الحساب قد تضيف حقولاً إلى users_db.
-    # بذلك لا يتوقف البوت عند وجود أكثر من جلسة محفوظة.
     saved_user_rows = list(users_db.items())
-    # استرجاع الجلسات والمهام المحفوظة بعد إعادة تشغيل السيرفر، من دون طلب كود دخول جديد.
     for uid_str, u_data in saved_user_rows:
         uid = int(uid_str)
         session_path = f"{SESSIONS_DIR}/user_{uid}"
@@ -7791,9 +8583,7 @@ async def main():
                     print(f"Session for user {uid} is no longer authorized; login is required once.")
             except Exception as e:
                 print(f"Failed to restore userbot session for {uid}: {e}")
-
     async def user_connection_guard():
-        """يحاول إعادة الاتصال بالجلسات المحفوظة عند انقطاع الشبكة من دون تسجيل دخول جديد."""
         while True:
             for uid, client in list(user_clients.items()):
                 try:
@@ -7804,11 +8594,9 @@ async def main():
                 except Exception as e:
                     print(f"Reconnect attempt failed for user {uid}: {e}")
             await asyncio.sleep(30)
-
     asyncio.create_task(user_connection_guard())
     print("Bot is running...")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
