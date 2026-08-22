@@ -171,13 +171,15 @@ def _premium_outgoing_text_payload(message, kwargs):
 
 
 async def _premium_client_send_message(self, entity, message="", *args, **kwargs):
-    if not _is_manager_bot_client(self):
+    skip_premium_emoji = bool(kwargs.pop("_skip_premium_emoji", False))
+    if not _is_manager_bot_client(self) and not skip_premium_emoji:
         message, kwargs = _premium_outgoing_text_payload(message, kwargs)
     return await _ORIGINAL_CLIENT_SEND_MESSAGE(self, entity, message, *args, **kwargs)
 
 
 async def _premium_client_edit_message(self, entity, message=None, text=None, *args, **kwargs):
-    if not _is_manager_bot_client(self):
+    skip_premium_emoji = bool(kwargs.pop("_skip_premium_emoji", False))
+    if not _is_manager_bot_client(self) and not skip_premium_emoji:
         if text is not None:
             text, kwargs = _premium_outgoing_text_payload(text, kwargs)
         elif isinstance(message, str):
@@ -1528,7 +1530,7 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
 
                     if should_reply and curr_target_msg_id:
                         try:
-                            await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id)
+                            await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id, _skip_premium_emoji=True)
                             sent = True
                         except Exception:
                             if target_uid:
@@ -1536,7 +1538,7 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                                     async for msg in client.iter_messages(chat_id, from_user=target_uid, limit=1):
                                         task_info["target_msg_id"] = msg.id
                                         curr_target_msg_id = msg.id
-                                        await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id)
+                                        await client.send_message(chat_id, final_text, reply_to=curr_target_msg_id, _skip_premium_emoji=True)
                                         sent = True
                                         break
                                 except Exception:
@@ -1554,7 +1556,7 @@ def start_running_task(client, owner_id, chat_id, mode, target_msg_id=None, targ
                                 pass
                         
                         try:
-                            await client.send_message(chat_id, final_text)
+                            await client.send_message(chat_id, final_text, _skip_premium_emoji=True)
                             sent = True
                         except Exception:
                             pass
@@ -3612,18 +3614,39 @@ async def register_userbot_events(client_inst, owner_id):
             # نتيجة أي أمر مكتوب بالرد تعود إلى الرسالة نفسها؛ من دون رد تبقى رسالة عادية.
             command_reply_to = event.reply_to_msg_id
 
+            def is_tastir_manual_context():
+                """يحدد أوامر وحالات التسطير اليدوية لتبقى نصوصها خالية من الزينة المميزة."""
+                raw_value = (event.raw_text or "").lstrip(".").strip()
+                state_step = str((user_states.get(owner_id) or {}).get("step", ""))
+                if any(token in state_step for token in ("tastir", "fardiyyat", "reply", "nick_am", "speed")):
+                    return True
+                configured = set()
+                for setting in (
+                    "tastir_start_cmds", "tastir_stop_cmds", "fardiyyat_start_cmds", "fardiyyat_stop_cmds",
+                    "reply_start_cmds", "reply_stop_cmds", "nick_am_stop_cmds",
+                ):
+                    configured.update(str(item).lstrip(".").strip() for item in user_info.get(setting, []) if str(item).strip())
+                configured.update({
+                    "تسطير", "ايقاف التسطير", "فرديات", "ايقاف الفرديات", "ريبلاي", "ايقاف الريبلاي",
+                    "نيك ام", "ايقاف نيك ام", "ايقاف العمليات", "ايقاف عملية", "العمليات",
+                })
+                return any(raw_value == command or raw_value.startswith(command + " ") for command in configured if command)
+
             async def command_reply(message, **kwargs):
                 # تستخدم النتائج المهمة هذا الخيار لتبقى في المحادثة بدلاً من الحذف المؤقت.
                 keep_result = bool(kwargs.pop("keep_result", False))
                 temporary_seconds = kwargs.pop("temporary_seconds", None)
                 if command_reply_to and "reply_to" not in kwargs:
                     kwargs["reply_to"] = command_reply_to
+                is_tastir_reply = is_tastir_manual_context()
                 outgoing_message = message
-                if isinstance(message, str) and "formatting_entities" not in kwargs and not kwargs.get("buttons"):
+                if not is_tastir_reply and isinstance(message, str) and "formatting_entities" not in kwargs and not kwargs.get("buttons"):
                     outgoing_message, premium_entities = prepare_premium_command_message(message)
                     if premium_entities:
                         kwargs["formatting_entities"] = premium_entities
                         kwargs["parse_mode"] = None
+                if is_tastir_reply:
+                    kwargs["_skip_premium_emoji"] = True
                 sent_message = await client_inst.send_message(chat_id, outgoing_message, **kwargs)
                 # لا تحذف القوائم والأزرار أو رسائل التقدم، ولا نتائج الترجمة والتحويل النهائية.
                 message_text = str(message or "")
@@ -5161,7 +5184,7 @@ async def register_userbot_events(client_inst, owner_id):
                     if phrases:
                         phrase = random.choice(phrases)
                         try:
-                            await client_inst.send_message(chat_id, phrase, reply_to=event.id)
+                            await client_inst.send_message(chat_id, phrase, reply_to=event.id, _skip_premium_emoji=True)
                         except Exception:
                             pass
 
